@@ -145,13 +145,14 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
 ]
 
-# For production, configure SMTP backend like below:
-# EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-# EMAIL_HOST = 'smtp.gmail.com'
-# EMAIL_PORT = 587
-# EMAIL_USE_TLS = True
-# EMAIL_HOST_USER = 'your-email@example.com'
-# EMAIL_HOST_PASSWORD = 'your-password'
+# Email configuration (example using console backend)
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = 'smtp.gmail.com'  # or your SMTP server
+EMAIL_PORT = 587
+EMAIL_USE_TLS = True
+EMAIL_HOST_USER = 'fqthedeveloper@gmail.com'
+EMAIL_HOST_PASSWORD = 'xqpy cfeb ryod fdkz'  # use an app-specific password
+
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (

@@ -1,4 +1,4 @@
-from rest_framework import viewsets, status, filters
+from rest_framework import viewsets, status, filters, permissions
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from django_filters.rest_framework import DjangoFilterBackend
@@ -15,6 +15,11 @@ from rest_framework.authtoken.models import Token
 from django.db import IntegrityError
 from django.db import IntegrityError, transaction
 from django.core.exceptions import ObjectDoesNotExist
+from rest_framework.permissions import IsAuthenticated
+from .permissions import IsAdminUserOnly
+from rest_framework.authentication import TokenAuthentication
+from rest_framework.exceptions import PermissionDenied, ValidationError
+import json
 
 
 
@@ -90,54 +95,153 @@ class LoginView(APIView):
             'role': user.user_type,
             'token': token.key,
             'force_password_change': user.force_password_change,
+            'first_name': user.first_name,
+            'is_verified': user.is_verified
         }, status=status.HTTP_200_OK)
+    
+
+class StudentViewSet(viewsets.ModelViewSet):
+    queryset = User.objects.filter(user_type='student')
+    serializer_class = StudentCreateSerializer
+    permission_classes = [permissions.IsAuthenticated, IsAdminUserOnly]
+    authentication_classes = [TokenAuthentication]
+
+class ForcePasswordChangeView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = PasswordChangeSerializer(data=request.data)
+        if serializer.is_valid():
+            request.user.set_password(serializer.validated_data['new_password'])
+            request.user.force_password_change = False
+            request.user.save()
+            return Response({"message": "Password changed successfully."})
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
 
 class SubjectViewSet(viewsets.ModelViewSet):
     queryset = Subject.objects.all()
     serializer_class = SubjectSerializer
 
+
 class QuestionViewSet(viewsets.ModelViewSet):
     queryset = Question.objects.all()
-    serializer_class = ExamQuestionSerializer
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    filterset_fields = ['subject']
-    search_fields = ['text']
+    serializer_class = QuestionSerializer  # Your serializer here
     
-    @action(detail=False, methods=['POST'])
-    def bulk_upload(self, request):
-        file = request.FILES['file']
-        process_excel(file)
-        return Response({'status': 'success'})
     
     @action(detail=False, methods=['GET'])
     def download_format(self, request):
+        # Sample data with all required columns
         data = {
-            'Subject': ['Math'],
-            'Question': ['What is 2+2?'],
-            'Option A': ['3'],
-            'Option B': ['4'],
-            'Option C': ['5'],
-            'Option D': ['6'],
-            'Correct Answer': ['B'],
-            'Marks': [1]
+            'Subject': ['Mathematics', 'Science'],
+            'Question': ['What is 2+2?', 'Water boils at?'],
+            'Option A': ['3', '90°C'],
+            'Option B': ['4', '100°C'],
+            'Option C': ['5', '110°C'],
+            'Option D': ['6', '120°C'],
+            'Correct Answers': ['B', 'B'],  # Note the plural 'Answers' here
+            'Marks': [1, 1],
+            'Is Multi': [False, False]  # Boolean to indicate if multiple correct answers allowed
         }
         df = pd.DataFrame(data)
-        response = HttpResponse(content_type='application/ms-excel')
+        response = HttpResponse(content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
         response['Content-Disposition'] = 'attachment; filename="question_format.xlsx"'
         df.to_excel(response, index=False)
         return response
 
+    @action(detail=False, methods=['POST'])
+    def bulk_upload(self, request):
+        file = request.FILES.get('file')
+        if not file:
+            return Response({'status': 'error', 'message': 'No file uploaded'}, status=400)
+
+        required_columns = [
+            'Subject', 'Question', 'Option A', 'Option B', 'Option C', 'Option D',
+            'Correct Answers', 'Marks', 'Is Multi'
+        ]
+
+        try:
+            df = pd.read_excel(file)
+        except Exception as e:
+            return Response({'status': 'error', 'message': f'Failed to read Excel file: {str(e)}'}, status=400)
+
+        missing_cols = [col for col in required_columns if col not in df.columns]
+        if missing_cols:
+            return Response({
+                'status': 'error',
+                'message': f'Excel file is missing required columns: {", ".join(missing_cols)}'
+            }, status=400)
+
+        try:
+            with transaction.atomic():
+                for _, row in df.iterrows():
+                    subject_obj, _ = Subject.objects.get_or_create(name=row['Subject'])
+
+                    options = {
+                        'A': row['Option A'],
+                        'B': row['Option B'],
+                        'C': row['Option C'],
+                        'D': row['Option D'],
+                    }
+
+                    correct_answers = str(row['Correct Answers']).replace(' ', '').upper()
+
+                    is_multi_val = row['Is Multi']
+                    if isinstance(is_multi_val, str):
+                        is_multi = is_multi_val.strip().lower() in ['true', '1', 'yes']
+                    else:
+                        is_multi = bool(is_multi_val)
+
+                    # Convert options dict to JSON string if needed
+                    import json
+                    options_json = json.dumps(options)
+
+                    Question.objects.create(
+                        subject=subject_obj,
+                        text=row['Question'],
+                        options=options_json,  # use options_json if your field is TextField
+                        correct_answers=correct_answers,
+                        marks=int(row['Marks']),
+                        is_multi=is_multi,
+                    )
+            return Response({'status': 'success', 'message': 'Questions uploaded successfully'})
+        except Exception as e:
+            return Response({'status': 'error', 'message': str(e)}, status=400)
+
 class ExamViewSet(viewsets.ModelViewSet):
     queryset = Exam.objects.all()
     serializer_class = ExamSerializer
+    
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        # For students, only show published exams
+        if self.request.user.is_authenticated and self.request.user.user_type == 'student':
+            return queryset.filter(is_published=True)
+        return queryset
     
     @action(detail=True, methods=['POST'])
     def publish(self, request, pk=None):
         exam = self.get_object()
         exam.is_published = True
         exam.save()
-        return Response({'status': 'published'})
+        
+        # Send email notifications to students
+        students = User.objects.filter(user_type='student', is_active=True)
+        notification_message = request.data.get(
+            'message', 
+            f'A new exam "{exam.title}" has been scheduled. Please check your dashboard for details.'
+        )
+        
+        for student in students:
+            send_mail(
+                subject=f"New Exam: {exam.title}",
+                message=notification_message,
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[student.email],
+                fail_silently=True,
+            )
+        
+        return Response({'status': 'published', 'recipients': students.count()})
     
     @action(detail=True, methods=['POST'])
     def unpublish(self, request, pk=None):
@@ -146,16 +250,20 @@ class ExamViewSet(viewsets.ModelViewSet):
         exam.save()
         return Response({'status': 'unpublished'})
 
+
 class ExamSessionViewSet(viewsets.ModelViewSet):
-    queryset = ExamSession.objects.all()
     serializer_class = ExamSessionSerializer
     
     def get_queryset(self):
-        queryset = super().get_queryset()
+        queryset = ExamSession.objects.all()
         user = self.request.user
         
-        if user.is_authenticated and user.user_type == 'student':
-            return queryset.filter(student=user)
+        if user.is_authenticated:
+            if user.user_type == 'student':
+                return queryset.filter(student=user)
+            elif user.user_type == 'teacher':
+                # Teachers can see sessions for their exams
+                return queryset.filter(exam__subject__teacher=user)
         return queryset
     
     @action(detail=True, methods=['POST'])
@@ -169,15 +277,91 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['POST'])
     def submit_exam(self, request, pk=None):
         session = self.get_object()
-        # Calculate score and create result
-        return Response({'status': 'exam submitted'})
+        
+        if session.is_completed:
+            return Response(
+                {'error': 'Exam already submitted'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+            
+        # Calculate score
+        answers = Answer.objects.filter(session=session)
+        total_marks = 0
+        score = 0
+        details = {}
+        
+        for answer in answers:
+            question = answer.question
+            total_marks += question.marks
+            
+            # Get correct and selected answers
+            correct_answers = set(question.correct_answers.split(','))
+            selected_answers = set(answer.selected_answers.split(','))
+            
+            # Calculate question result
+            is_correct = correct_answers == selected_answers
+            if is_correct:
+                score += question.marks
+                
+            details[question.id] = {
+                'correct': list(correct_answers),
+                'selected': list(selected_answers),
+                'is_correct': is_correct,
+                'marks': question.marks,
+                'earned': question.marks if is_correct else 0
+            }
+        
+        # Create result
+        result = Result.objects.create(
+            session=session,
+            score=score,
+            total_marks=total_marks,
+            details=details
+        )
+        
+        # Update session
+        session.end_time = timezone.now()
+        session.is_completed = True
+        session.save()
+        
+        return Response(ResultSerializer(result).data)
 
 class AnswerViewSet(viewsets.ModelViewSet):
-    queryset = Answer.objects.all()
     serializer_class = AnswerSerializer
+    
+    def get_queryset(self):
+        queryset = Answer.objects.all()
+        user = self.request.user
+        
+        if user.is_authenticated and user.user_type == 'student':
+            return queryset.filter(session__student=user)
+        return queryset
+    
+    def perform_create(self, serializer):
+        session = serializer.validated_data['session']
+        
+        # Validate that session belongs to current user
+        if session.student != self.request.user:
+            raise PermissionDenied("You don't have permission for this session")
+            
+        # Validate that session is active
+        if session.is_completed:
+            raise ValidationError("Exam session has already ended")
+            
+        serializer.save()
+
 
 class ResultViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = Result.objects.all()
     serializer_class = ResultSerializer
-
+    
+    def get_queryset(self):
+        queryset = Result.objects.all()
+        user = self.request.user
+        
+        if user.is_authenticated:
+            if user.user_type == 'student':
+                return queryset.filter(session__student=user)
+            elif user.user_type == 'teacher':
+                return queryset.filter(session__exam__subject__teacher=user)
+        return queryset
     
