@@ -16,7 +16,7 @@ router.register(r'students', views.StudentViewSet, basename='student')
 urlpatterns = [
     path('', include(router.urls)),
     path('login/', LoginView.as_view(), name='login'),
-    path('change-password/', ForcePasswordChangeView.as_view(), name='force-password-change'),
+    path('change-password/', ForcePasswordChangeView.as_view(), name='change-password'),
     path('exams/<int:pk>/publish/', views.ExamViewSet.as_view({'post': 'publish'}), name='exam-publish'),
     path('exams/<int:pk>/unpublish/', views.ExamViewSet.as_view({'post': 'unpublish'}), name='exam-unpublish'),
     path('sessions/<int:pk>/start/', views.ExamSessionViewSet.as_view({'post': 'start_exam'}), name='session-start'),

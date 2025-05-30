@@ -33,6 +33,7 @@ class UserViewSet(viewsets.ModelViewSet):
     serializer_class = UserSerializer
 
 
+
 class LoginView(APIView):
     permission_classes = [AllowAny]
 
@@ -103,11 +104,44 @@ class LoginView(APIView):
 class StudentViewSet(viewsets.ModelViewSet):
     queryset = User.objects.filter(user_type='student')
     serializer_class = StudentCreateSerializer
-    permission_classes = [permissions.IsAuthenticated, IsAdminUserOnly]
+    permission_classes = [IsAuthenticated, IsAdminUserOnly]
     authentication_classes = [TokenAuthentication]
+
+    def list(self, request, *args, **kwargs):
+        print("Logged in user:", request.user)
+        print("Returning students:", self.get_queryset())
+        return super().list(request, *args, **kwargs)
+
+    def update(self, request, *args, **kwargs):  # <--- This method goes here in the ViewSet
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        old_email = instance.email
+
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+
+        new_email = serializer.validated_data.get('email', old_email)
+
+        if new_email != old_email:
+            send_mail(
+                subject='Your email has been updated',
+                message=(
+                    f'Hello {instance.first_name},\n\n'
+                    f'Your email address has been changed to {new_email}.\n'
+                    'If you did not request this change, please contact support immediately.'
+                ),
+                from_email='no-reply@example.com',
+                recipient_list=[new_email],
+                fail_silently=False,
+            )
+
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
 
 class ForcePasswordChangeView(APIView):
     permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
 
     def post(self, request):
         serializer = PasswordChangeSerializer(data=request.data)
@@ -117,7 +151,6 @@ class ForcePasswordChangeView(APIView):
             request.user.save()
             return Response({"message": "Password changed successfully."})
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-    
 
 class SubjectViewSet(viewsets.ModelViewSet):
     queryset = Subject.objects.all()
@@ -214,7 +247,6 @@ class ExamViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         queryset = super().get_queryset()
-        # For students, only show published exams
         if self.request.user.is_authenticated and self.request.user.user_type == 'student':
             return queryset.filter(is_published=True)
         return queryset
@@ -224,14 +256,11 @@ class ExamViewSet(viewsets.ModelViewSet):
         exam = self.get_object()
         exam.is_published = True
         exam.save()
-        
-        # Send email notifications to students
         students = User.objects.filter(user_type='student', is_active=True)
         notification_message = request.data.get(
             'message', 
             f'A new exam "{exam.title}" has been scheduled. Please check your dashboard for details.'
         )
-        
         for student in students:
             send_mail(
                 subject=f"New Exam: {exam.title}",
@@ -240,7 +269,6 @@ class ExamViewSet(viewsets.ModelViewSet):
                 recipient_list=[student.email],
                 fail_silently=True,
             )
-        
         return Response({'status': 'published', 'recipients': students.count()})
     
     @action(detail=True, methods=['POST'])
@@ -250,19 +278,16 @@ class ExamViewSet(viewsets.ModelViewSet):
         exam.save()
         return Response({'status': 'unpublished'})
 
-
 class ExamSessionViewSet(viewsets.ModelViewSet):
     serializer_class = ExamSessionSerializer
     
     def get_queryset(self):
         queryset = ExamSession.objects.all()
         user = self.request.user
-        
         if user.is_authenticated:
             if user.user_type == 'student':
                 return queryset.filter(student=user)
             elif user.user_type == 'teacher':
-                # Teachers can see sessions for their exams
                 return queryset.filter(exam__subject__teacher=user)
         return queryset
     
@@ -277,32 +302,30 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['POST'])
     def submit_exam(self, request, pk=None):
         session = self.get_object()
-        
         if session.is_completed:
             return Response(
                 {'error': 'Exam already submitted'}, 
                 status=status.HTTP_400_BAD_REQUEST
             )
-            
-        # Calculate score
+        answers_data = request.data.get('answers', [])
+        for answer_data in answers_data:
+            Answer.objects.create(
+                session=session,
+                question_id=answer_data['question'],
+                selected_answers=answer_data['selected_answers']
+            )
         answers = Answer.objects.filter(session=session)
         total_marks = 0
         score = 0
         details = {}
-        
         for answer in answers:
             question = answer.question
             total_marks += question.marks
-            
-            # Get correct and selected answers
             correct_answers = set(question.correct_answers.split(','))
-            selected_answers = set(answer.selected_answers.split(','))
-            
-            # Calculate question result
+            selected_answers = set(answer.selected_answers.split(',')) if answer.selected_answers else set()
             is_correct = correct_answers == selected_answers
             if is_correct:
                 score += question.marks
-                
             details[question.id] = {
                 'correct': list(correct_answers),
                 'selected': list(selected_answers),
@@ -310,58 +333,33 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
                 'marks': question.marks,
                 'earned': question.marks if is_correct else 0
             }
-        
-        # Create result
         result = Result.objects.create(
             session=session,
             score=score,
             total_marks=total_marks,
             details=details
         )
-        
-        # Update session
         session.end_time = timezone.now()
         session.is_completed = True
         session.save()
-        
         return Response(ResultSerializer(result).data)
 
 class AnswerViewSet(viewsets.ModelViewSet):
     serializer_class = AnswerSerializer
-    
     def get_queryset(self):
-        queryset = Answer.objects.all()
-        user = self.request.user
-        
-        if user.is_authenticated and user.user_type == 'student':
-            return queryset.filter(session__student=user)
-        return queryset
-    
+        return Answer.objects.filter(session__student=self.request.user)
     def perform_create(self, serializer):
         session = serializer.validated_data['session']
-        
-        # Validate that session belongs to current user
         if session.student != self.request.user:
-            raise PermissionDenied("You don't have permission for this session")
-            
-        # Validate that session is active
+            raise PermissionDenied("Invalid session owner")
         if session.is_completed:
-            raise ValidationError("Exam session has already ended")
-            
+            raise ValidationError("Session already completed")
         serializer.save()
-
 
 class ResultViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = ResultSerializer
-    
     def get_queryset(self):
-        queryset = Result.objects.all()
         user = self.request.user
-        
-        if user.is_authenticated:
-            if user.user_type == 'student':
-                return queryset.filter(session__student=user)
-            elif user.user_type == 'teacher':
-                return queryset.filter(session__exam__subject__teacher=user)
-        return queryset
-    
+        if user.user_type == 'student':
+            return Result.objects.filter(session__student=user)
+        return Result.objects.none()

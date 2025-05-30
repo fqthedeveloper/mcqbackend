@@ -6,6 +6,10 @@ import logging
 from django.contrib.auth.password_validation import validate_password
 from django.core.mail import send_mail
 from django.utils.crypto import get_random_string
+from rest_framework import status
+from rest_framework.response import Response
+
+
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -84,7 +88,7 @@ class StudentCreateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = User
-        fields = ['id', 'email', 'username', 'first_name', 'last_name']
+        fields = ['id', 'email', 'username', 'first_name', 'last_name', 'is_verified', 'force_password_change']
 
     def create(self, validated_data):
         password = get_random_string(length=10)
@@ -112,9 +116,16 @@ class StudentCreateSerializer(serializers.ModelSerializer):
         )
         return user
 
-
 class PasswordChangeSerializer(serializers.Serializer):
-    new_password = serializers.CharField(write_only=True, required=True, validators=[validate_password])
+    new_password = serializers.CharField(
+        write_only=True, required=True, validators=[validate_password]
+    )
+    confirm_password = serializers.CharField(write_only=True, required=True)
+
+    def validate(self, data):
+        if data['new_password'] != data['confirm_password']:
+            raise serializers.ValidationError("Passwords do not match.")
+        return data
 
 
 class SubjectSerializer(serializers.ModelSerializer):
@@ -135,7 +146,6 @@ class QuestionSerializer(serializers.ModelSerializer):
         if not Exam.objects.filter(id=value.id).exists():
             raise serializers.ValidationError("Exam does not exist")
         return value
-
 class ExamQuestionSerializer(serializers.ModelSerializer):
     id = serializers.ReadOnlyField(source='question.id')
     text = serializers.ReadOnlyField(source='question.text')
@@ -147,7 +157,6 @@ class ExamQuestionSerializer(serializers.ModelSerializer):
         model = ExamQuestion
         fields = ['id', 'text', 'marks', 'is_multi', 'options', 'order']
 
-
 class ExamSerializer(serializers.ModelSerializer):
     questions = ExamQuestionSerializer(source='examquestion_set', many=True, read_only=True)
     selected_questions = serializers.ListField(
@@ -156,22 +165,25 @@ class ExamSerializer(serializers.ModelSerializer):
         required=False
     )
     subject_name = serializers.CharField(source='subject.name', read_only=True)
-
     created_at = serializers.DateTimeField(format='%Y-%m-%d %H:%M:%S', read_only=True)
     updated_at = serializers.DateTimeField(format='%Y-%m-%d %H:%M:%S', read_only=True)
+    question_count = serializers.SerializerMethodField()
     
     class Meta:
         model = Exam
         fields = [
             'id', 'title', 'subject', 'subject_name', 'mode', 'duration', 
             'start_time', 'end_time', 'is_published', 'created_at', 'updated_at',
-            'questions', 'selected_questions'
+            'questions', 'selected_questions', 'question_count'
         ]
         extra_kwargs = {
             'subject': {'required': True},
             'mode': {'required': True},
             'duration': {'required': True},
         }
+
+    def get_question_count(self, obj):
+        return obj.questions.count()
 
     def create(self, validated_data):
         selected_questions = validated_data.pop('selected_questions', [])
