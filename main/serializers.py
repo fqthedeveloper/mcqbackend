@@ -132,99 +132,82 @@ class SubjectSerializer(serializers.ModelSerializer):
         model = Subject
         fields = ['id', 'name']
 
-
 class QuestionSerializer(serializers.ModelSerializer):
-    options = serializers.DictField(write_only=True)
-    correct_answers = serializers.JSONField(write_only=True)  # can be str or list
-    subject_id = serializers.PrimaryKeyRelatedField(
-        queryset=Subject.objects.all(), source='subject', write_only=True
-    )
+    options = serializers.SerializerMethodField()
     subject = serializers.StringRelatedField(read_only=True)
-
+    
     class Meta:
         model = Question
         fields = [
-            'id', 'subject_id', 'text',
-            'options', 'correct_answers',
-            'is_multi', 'marks',
-            'option_a', 'option_b', 'option_c', 'option_d', 'correct_option', 'explanation',
-            'subject'
+            'id', 'subject', 'text', 'is_multi', 'marks',
+            'option_a', 'option_b', 'option_c', 'option_d',
+            'options', 'correct_option', 'explanation'
         ]
-
         read_only_fields = ['option_a', 'option_b', 'option_c', 'option_d', 'correct_option']
 
+    def get_options(self, obj):
+        # Return options as an array of strings
+        return [
+            obj.option_a,
+            obj.option_b,
+            obj.option_c,
+            obj.option_d
+        ]
+
+    def to_internal_value(self, data):
+        # Handle create/update operations
+        internal_value = super().to_internal_value(data)
+        
+        # Process options dictionary if provided
+        if 'options' in data:
+            options = data['options']
+            if isinstance(options, dict):
+                internal_value['option_a'] = options.get('A', '')
+                internal_value['option_b'] = options.get('B', '')
+                internal_value['option_c'] = options.get('C', '')
+                internal_value['option_d'] = options.get('D', '')
+        
+        # Process correct answers
+        if 'correct_answers' in data:
+            correct_answers = data['correct_answers']
+            is_multi = internal_value.get('is_multi', False)
+            
+            if is_multi:
+                if isinstance(correct_answers, list):
+                    internal_value['correct_option'] = ','.join(correct_answers)
+            else:
+                if isinstance(correct_answers, str):
+                    internal_value['correct_option'] = correct_answers
+        
+        return internal_value
+
     def validate(self, data):
-        options = data.get('options')
-        correct_answers = data.get('correct_answers')
-        is_multi = data.get('is_multi')
-
-        # Validate options
-        if not options or not all(k in options for k in ['A', 'B', 'C', 'D']):
-            raise serializers.ValidationError("All 4 options A, B, C, D must be provided.")
-
-        # Validate correct_answers type based on is_multi
+        # Custom validation logic
+        is_multi = data.get('is_multi', False)
+        correct_option = data.get('correct_option', '')
+        
         if is_multi:
-            if not isinstance(correct_answers, list):
+            if not isinstance(correct_option, str) or not all(opt in ['A','B','C','D'] for opt in correct_option.split(',')):
                 raise serializers.ValidationError({
-                    'correct_answers': 'Must be a list of strings when is_multi is True.'
+                    'correct_answers': 'Must be a comma-separated string of valid options (A,B,C,D) when is_multi is True.'
                 })
-            # Check all elements are valid keys
-            for ans in correct_answers:
-                if ans not in options.keys():
-                    raise serializers.ValidationError({
-                        'correct_answers': f'Answer "{ans}" is not a valid option key.'
-                    })
         else:
-            # Single answer should be a string
-            if not isinstance(correct_answers, str):
+            if correct_option not in ['A','B','C','D']:
                 raise serializers.ValidationError({
-                    'correct_answers': 'Must be a string when is_multi is False.'
+                    'correct_answers': 'Must be a single option (A,B,C,D) when is_multi is False.'
                 })
-            if correct_answers not in options.keys():
-                raise serializers.ValidationError({
-                    'correct_answers': 'Correct answer must be one of the option keys (A, B, C, D).'
-                })
-
+        
         return data
 
-    def create(self, validated_data):
-        options = validated_data.pop('options')
-        correct_answers = validated_data.pop('correct_answers')
-        is_multi = validated_data.get('is_multi', False)
-
-        # Assign options to model fields
-        validated_data['option_a'] = options['A']
-        validated_data['option_b'] = options['B']
-        validated_data['option_c'] = options['C']
-        validated_data['option_d'] = options['D']
-
-        # Store correct_option as comma-separated string for multiple answers
-        if is_multi:
-            validated_data['correct_option'] = ','.join(correct_answers)
-        else:
-            validated_data['correct_option'] = correct_answers
-
-        return super().create(validated_data)
-    
-    
 class ExamQuestionSerializer(serializers.ModelSerializer):
-    id = serializers.ReadOnlyField(source='question.id')
-    text = serializers.ReadOnlyField(source='question.text')
-    marks = serializers.ReadOnlyField(source='question.marks')
-    is_multi = serializers.ReadOnlyField(source='question.is_multi')
-    options = serializers.ReadOnlyField(source='question.options')
-
+    question = QuestionSerializer(read_only=True)
+    
     class Meta:
         model = ExamQuestion
-        fields = ['id', 'text', 'marks', 'is_multi', 'options', 'order']
+        fields = ['id', 'question', 'order']
 
 class ExamSerializer(serializers.ModelSerializer):
     questions = ExamQuestionSerializer(source='examquestion_set', many=True, read_only=True)
-    selected_questions = serializers.ListField(
-        child=serializers.IntegerField(),
-        write_only=True,
-        required=False
-    )
     subject_name = serializers.CharField(source='subject.name', read_only=True)
     created_at = serializers.DateTimeField(format='%Y-%m-%d %H:%M:%S', read_only=True)
     updated_at = serializers.DateTimeField(format='%Y-%m-%d %H:%M:%S', read_only=True)
@@ -235,16 +218,11 @@ class ExamSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'title', 'subject', 'subject_name', 'mode', 'duration', 
             'start_time', 'end_time', 'is_published', 'created_at', 'updated_at',
-            'questions', 'selected_questions', 'question_count'
+            'questions', 'question_count'
         ]
-        extra_kwargs = {
-            'subject': {'required': True},
-            'mode': {'required': True},
-            'duration': {'required': True},
-        }
 
     def get_question_count(self, obj):
-        return obj.questions.count()
+        return obj.examquestion_set.count()
 
     def create(self, validated_data):
         selected_questions = validated_data.pop('selected_questions', [])
@@ -254,7 +232,7 @@ class ExamSerializer(serializers.ModelSerializer):
                 question = Question.objects.get(id=question_id)
                 ExamQuestion.objects.create(exam=exam, question=question, order=order)
             except Question.DoesNotExist:
-                pass
+                continue
         return exam
 
     def update(self, instance, validated_data):
@@ -262,6 +240,7 @@ class ExamSerializer(serializers.ModelSerializer):
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save()
+
         if selected_questions is not None:
             instance.examquestion_set.all().delete()
             for order, question_id in enumerate(selected_questions):
@@ -269,7 +248,8 @@ class ExamSerializer(serializers.ModelSerializer):
                     question = Question.objects.get(id=question_id)
                     ExamQuestion.objects.create(exam=instance, question=question, order=order)
                 except Question.DoesNotExist:
-                    pass
+                    continue
+
         return instance
 
 class ExamSessionSerializer(serializers.ModelSerializer):
