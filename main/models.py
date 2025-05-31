@@ -45,16 +45,22 @@ class Subject(models.Model):
         return self.name  
     
 class Question(models.Model):
+
     subject = models.ForeignKey(Subject, on_delete=models.CASCADE)
     text = models.TextField(unique=True)  # Unique to prevent duplicate questions
-    options = models.JSONField()  # {A: "Option1", B: "Option2"}
-    correct_answers = models.CharField(max_length=50)  # "A,B,D"
+    option_a = models.CharField(max_length=255)
+    option_b = models.CharField(max_length=255)
+    option_c = models.CharField(max_length=255)
+    option_d = models.CharField(max_length=255)
+    correct_option = models.CharField(max_length=10)
+    explanation = models.TextField(blank=True, null=True)
     marks = models.PositiveIntegerField()
     is_multi = models.BooleanField(default=False)
     created_at = models.DateTimeField(default=timezone.now)
 
     def __str__(self):
         return self.text  
+
 
 
 class Exam(models.Model):

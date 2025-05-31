@@ -20,6 +20,7 @@ from .permissions import IsAdminUserOnly
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.exceptions import PermissionDenied, ValidationError
 import json
+from django.conf import settings
 
 
 
@@ -159,12 +160,10 @@ class SubjectViewSet(viewsets.ModelViewSet):
 
 class QuestionViewSet(viewsets.ModelViewSet):
     queryset = Question.objects.all()
-    serializer_class = QuestionSerializer  # Your serializer here
-    
-    
+    serializer_class = QuestionSerializer
+
     @action(detail=False, methods=['GET'])
     def download_format(self, request):
-        # Sample data with all required columns
         data = {
             'Subject': ['Mathematics', 'Science'],
             'Question': ['What is 2+2?', 'Water boils at?'],
@@ -172,9 +171,9 @@ class QuestionViewSet(viewsets.ModelViewSet):
             'Option B': ['4', '100°C'],
             'Option C': ['5', '110°C'],
             'Option D': ['6', '120°C'],
-            'Correct Answers': ['B', 'B'],  # Note the plural 'Answers' here
+            'Correct Answers': ['B', 'B'],  # Comma separated for multi
             'Marks': [1, 1],
-            'Is Multi': [False, False]  # Boolean to indicate if multiple correct answers allowed
+            'Is Multi': [False, False]
         }
         df = pd.DataFrame(data)
         response = HttpResponse(content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
@@ -189,7 +188,8 @@ class QuestionViewSet(viewsets.ModelViewSet):
             return Response({'status': 'error', 'message': 'No file uploaded'}, status=400)
 
         required_columns = [
-            'Subject', 'Question', 'Option A', 'Option B', 'Option C', 'Option D',
+            'Subject', 'Question',
+            'Option A', 'Option B', 'Option C', 'Option D',
             'Correct Answers', 'Marks', 'Is Multi'
         ]
 
@@ -202,7 +202,7 @@ class QuestionViewSet(viewsets.ModelViewSet):
         if missing_cols:
             return Response({
                 'status': 'error',
-                'message': f'Excel file is missing required columns: {", ".join(missing_cols)}'
+                'message': f'Missing columns: {", ".join(missing_cols)}'
             }, status=400)
 
         try:
@@ -210,36 +210,33 @@ class QuestionViewSet(viewsets.ModelViewSet):
                 for _, row in df.iterrows():
                     subject_obj, _ = Subject.objects.get_or_create(name=row['Subject'])
 
-                    options = {
-                        'A': row['Option A'],
-                        'B': row['Option B'],
-                        'C': row['Option C'],
-                        'D': row['Option D'],
-                    }
-
                     correct_answers = str(row['Correct Answers']).replace(' ', '').upper()
 
                     is_multi_val = row['Is Multi']
-                    if isinstance(is_multi_val, str):
-                        is_multi = is_multi_val.strip().lower() in ['true', '1', 'yes']
-                    else:
-                        is_multi = bool(is_multi_val)
+                    is_multi = str(is_multi_val).strip().lower() in ['true', '1', 'yes']
 
-                    # Convert options dict to JSON string if needed
-                    import json
-                    options_json = json.dumps(options)
+                    if is_multi:
+                        if not all(opt in ['A', 'B', 'C', 'D'] for opt in correct_answers.split(',')):
+                            raise ValueError(f"Invalid correct options in row: {correct_answers}")
+                    else:
+                        if correct_answers not in ['A', 'B', 'C', 'D']:
+                            raise ValueError(f"Invalid single correct option in row: {correct_answers}")
 
                     Question.objects.create(
                         subject=subject_obj,
                         text=row['Question'],
-                        options=options_json,  # use options_json if your field is TextField
-                        correct_answers=correct_answers,
+                        option_a=row['Option A'],
+                        option_b=row['Option B'],
+                        option_c=row['Option C'],
+                        option_d=row['Option D'],
+                        correct_option=correct_answers,
                         marks=int(row['Marks']),
-                        is_multi=is_multi,
+                        is_multi=is_multi
                     )
             return Response({'status': 'success', 'message': 'Questions uploaded successfully'})
         except Exception as e:
             return Response({'status': 'error', 'message': str(e)}, status=400)
+        
 
 class ExamViewSet(viewsets.ModelViewSet):
     queryset = Exam.objects.all()
