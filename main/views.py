@@ -18,7 +18,7 @@ from django.db import IntegrityError, transaction
 from django.core.exceptions import ObjectDoesNotExist
 from rest_framework.permissions import IsAuthenticated
 from .permissions import IsAdminUserOnly
-from rest_framework.authentication import TokenAuthentication
+from rest_framework.authentication import TokenAuthentication, SessionAuthentication
 from rest_framework.exceptions import PermissionDenied, ValidationError
 import json
 from django.conf import settings
@@ -242,12 +242,13 @@ class QuestionViewSet(viewsets.ModelViewSet):
 class ExamViewSet(viewsets.ModelViewSet):
     queryset = Exam.objects.all()
     serializer_class = ExamSerializer
+    authentication_classes = [SessionAuthentication, TokenAuthentication]
+    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         user = self.request.user
         qs = super().get_queryset()
-        if user.is_authenticated and user.user_type == 'student':
-            # Students only see published exams
+        if user.is_authenticated and hasattr(user, 'user_type') and user.user_type == 'student':
             return qs.filter(is_published=True)
         return qs
 
@@ -257,24 +258,20 @@ class ExamViewSet(viewsets.ModelViewSet):
         exam.is_published = True
         exam.save()
 
-        # Notify all active students by email
         students = User.objects.filter(user_type='student', is_active=True)
-        notification_message = request.data.get(
+        message = request.data.get(
             'message',
             f'A new exam "{exam.title}" has been scheduled. Please check your dashboard for details.'
         )
         for student in students:
             send_mail(
                 subject=f"New Exam: {exam.title}",
-                message=notification_message,
+                message=message,
                 from_email=settings.DEFAULT_FROM_EMAIL,
                 recipient_list=[student.email],
-                fail_silently=True,
+                fail_silently=True
             )
-        return Response({
-            'status': 'published',
-            'recipients': students.count()
-        })
+        return Response({'status': 'published', 'recipients': students.count()})
 
     @action(detail=True, methods=['POST'])
     def unpublish(self, request, pk=None):
@@ -283,7 +280,17 @@ class ExamViewSet(viewsets.ModelViewSet):
         exam.save()
         return Response({'status': 'unpublished'})
     
+
+   # views.py
 class ExamSessionViewSet(viewsets.ModelViewSet):
+    """
+    Handles:
+      - create()            → POST /api/sessions/            (creates new session)
+      - validate_session()  → GET  /api/sessions/validate/<exam_id>/
+      - start_exam()        → POST /api/sessions/<pk>/start_exam/
+      - save_progress()     → POST /api/sessions/<pk>/save_progress/
+      - submit_exam()       → POST /api/sessions/<pk>/submit_exam/
+    """
     serializer_class = ExamSessionSerializer
     permission_classes = [IsAuthenticated]
     authentication_classes = [TokenAuthentication]
@@ -291,40 +298,134 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         qs = ExamSession.objects.all()
-        if user.is_authenticated:
-            if user.user_type == 'student':
-                return qs.filter(student=user)
-            elif user.user_type == 'teacher':
-                return qs.filter(exam__subject__teacher=user)
+        if user.user_type == 'student':
+            return qs.filter(student=user)
+        elif user.user_type == 'teacher':
+            return qs.filter(exam__subject__teacher=user)
         return qs
 
     def create(self, request, *args, **kwargs):
         student = request.user
         exam_id = request.data.get('exam')
         if not exam_id:
-            return Response({'error': 'Exam field is required.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'error': 'Exam field is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         exam = get_object_or_404(Exam, id=exam_id)
 
-        # Get or create session to avoid UNIQUE constraint error
-        session, created = ExamSession.objects.get_or_create(student=student, exam=exam)
+        existing_session = ExamSession.objects.filter(
+            student=student,
+            exam=exam,
+            is_completed=False
+        ).first()
+
+        if existing_session:
+            return Response(
+                {'error': 'You already have an active session.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        session = ExamSession.objects.create(
+            student=student,
+            exam=exam,
+            is_completed=False
+        )
+        serializer = self.get_serializer(session)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['GET'], url_path='validate/(?P<exam_id>[0-9]+)')
+    def validate_session(self, request, exam_id=None):
+        """
+        If an active, incomplete session exists, return it.
+        Otherwise, create a new one.
+        """
+        student = request.user
+        exam = get_object_or_404(Exam, id=exam_id)
+
+        session = ExamSession.objects.filter(
+            student=student,
+            exam=exam,
+            is_completed=False
+        ).first()
+
+        if not session:
+            try:
+                session = ExamSession.objects.create(
+                    student=student,
+                    exam=exam,
+                    is_completed=False
+                )
+            except IntegrityError:
+                # Another thread/request created it first—fetch the existing one
+                session = ExamSession.objects.get(student=student, exam=exam)
 
         serializer = self.get_serializer(session)
-        status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
-        return Response(serializer.data, status=status_code)
+        return Response(serializer.data)
 
     @action(detail=True, methods=['POST'])
     def start_exam(self, request, pk=None):
+        """
+        Marks the session’s start_time if not already set.
+        """
         session = self.get_object()
         if session.student != request.user:
             raise PermissionDenied("You do not own this session.")
+
         if not session.start_time:
             session.start_time = timezone.now()
             session.save()
         return Response({'status': 'exam started'})
 
+    @action(detail=True, methods=['POST'], url_path='save_progress')
+    def save_progress(self, request, pk=None):
+        """
+        Saves intermediate answers + elapsed_time. 
+        Expects payload: { "elapsed_time": <seconds>, "answers": [ { question: <id>, selected_answers: "A,C" }, … ] }
+        """
+        session = self.get_object()
+        user = request.user
+
+        if session.student != user:
+            raise PermissionDenied("Invalid session owner")
+
+        # We do not allow saving if already completed
+        if session.is_completed:
+            return Response(
+                {'error': 'Cannot save—exam already submitted.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        answers_data = request.data.get('answers', [])
+        elapsed_time = request.data.get('elapsed_time', 0)
+
+        if not isinstance(answers_data, list):
+            raise ValidationError("`answers` must be a list of answer objects.")
+
+        # Overwrite any existing saved answers for this session
+        Answer.objects.filter(session=session).delete()
+
+        for answer_data in answers_data:
+            question_id = answer_data.get('question')
+            selected_answers = answer_data.get('selected_answers', '')
+            Answer.objects.create(
+                session=session,
+                question_id=question_id,
+                selected_answers=selected_answers
+            )
+
+        # Save elapsed_time to the session
+        session.elapsed_time = elapsed_time
+        session.save()
+
+        return Response({'status': 'progress saved'}, status=status.HTTP_200_OK)
+
     @action(detail=True, methods=['POST'])
     def submit_exam(self, request, pk=None):
+        """
+        Final submission. Calculates score, marks session complete.
+        """
         session = self.get_object()
         user = request.user
 
@@ -338,10 +439,12 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
             )
 
         answers_data = request.data.get('answers', [])
-        if not isinstance(answers_data, list):
-            raise ValidationError("answers must be a list of answer objects.")
+        elapsed_time = request.data.get('elapsed_time', 0)
 
-        # Delete existing answers if any, to avoid duplicates on resubmission
+        if not isinstance(answers_data, list):
+            raise ValidationError("`answers` must be a list of answer objects.")
+
+        # Overwrite any existing answers
         Answer.objects.filter(session=session).delete()
 
         for answer_data in answers_data:
@@ -353,6 +456,7 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
                 selected_answers=selected_answers
             )
 
+        # Grading
         answers = Answer.objects.filter(session=session)
         total_marks = 0
         score = 0
@@ -361,10 +465,8 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
         for answer in answers:
             question = answer.question
             total_marks += question.marks
-
-            correct_set = set(question.correct_option.split(',')) if question.correct_option else set()
-            selected_set = set(answer.selected_answers.split(',')) if answer.selected_answers else set()
-
+            correct_set = set(question.correct_option.split(','))
+            selected_set = set(answer.selected_answers.split(','))
             is_correct = (correct_set == selected_set)
             earned = question.marks if is_correct else 0
             if is_correct:
@@ -391,9 +493,11 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
 
         return Response(ResultSerializer(result).data, status=status.HTTP_200_OK)
 
+
 class AnswerViewSet(viewsets.ModelViewSet):
     serializer_class = AnswerSerializer
     permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
 
     def get_queryset(self):
         return Answer.objects.filter(session__student=self.request.user)
@@ -409,29 +513,10 @@ class AnswerViewSet(viewsets.ModelViewSet):
 class ResultViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = ResultSerializer
     permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
 
     def get_queryset(self):
         user = self.request.user
         if user.user_type == 'student':
             return Result.objects.filter(session__student=user)
-        return Result.objects.none()
-    
-    def perform_create(self, serializer):
-        session = serializer.validated_data.get('session')
-        if session.student != self.request.user:
-            raise PermissionDenied("Invalid session owner")
-        if session.is_completed:
-            raise ValidationError("Session already completed")
-        serializer.save()
-
-
-# 3.4. ResultViewSet (students only read their own results)
-class ResultViewSet(viewsets.ReadOnlyModelViewSet):
-    serializer_class = ResultSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_queryset(self):
-        user = self.request.user
-        if user.user_type == 'student':
-            return Result.objects.filter(session__student=user)
-        return Result.objects.none()
+        return Result.objects.all()  # Teachers can see all results
