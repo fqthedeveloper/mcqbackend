@@ -40,66 +40,77 @@ class LoginView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
-        serializer = LoginSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        
-        user = serializer.validated_data['user']
-        
-        # Token creation with robust error handling
-        token = None
+        username_or_email = request.data.get('username_or_email')
+        password = request.data.get('password')
+
+        user_exists = User.objects.filter(
+            Q(username=username_or_email) |
+            Q(email=username_or_email)
+        ).exists()
+
+        if not user_exists:
+            return Response(
+                {"username_or_email": ["User with this email or username does not exist."]},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        user = authenticate(username=username_or_email, password=password)
+
+        if not user:
+            try:
+                email_user = User.objects.get(email=username_or_email)
+                user = authenticate(username=email_user.username, password=password)
+            except User.DoesNotExist:
+                user = None
+
+        if not user:
+            return Response(
+                {"password": ["Incorrect password."]},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         try:
-            # First try to get existing token
             token = Token.objects.get(user=user)
         except Token.DoesNotExist:
-            # If token doesn't exist, create a new one
             try:
-                # Use atomic transaction to prevent partial creation
                 with transaction.atomic():
                     token = Token.objects.create(user=user)
-            except IntegrityError as e:
-                logger.error(f"Token creation IntegrityError: {str(e)}")
-                
-                # Check if user was deleted during the process
+            except IntegrityError:
                 if not User.objects.filter(pk=user.pk).exists():
                     return Response(
-                        {"error": "User account no longer exists"},
+                        {"error": "User account no longer exists."},
                         status=status.HTTP_400_BAD_REQUEST
                     )
-                
-                # Token might have been created by concurrent request
                 try:
                     token = Token.objects.get(user=user)
                 except Token.DoesNotExist:
-                    logger.critical(f"Token missing after creation attempt: {user.id}")
-                    # Attempt to create token with forced save
                     try:
                         token = Token(user=user)
                         token.save(force_insert=True)
-                        logger.info(f"Successfully created token for user {user.id} with forced save")
-                    except Exception as save_error:
-                        logger.exception(f"Forced token creation failed: {str(save_error)}")
+                    except Exception:
                         return Response(
                             {"error": "Authentication system error. Please contact support."},
                             status=status.HTTP_500_INTERNAL_SERVER_ERROR
                         )
-            except Exception as e:
-                logger.exception(f"Token creation failed: {str(e)}")
+            except Exception:
                 return Response(
                     {"error": "Authentication service unavailable. Please try again."},
                     status=status.HTTP_503_SERVICE_UNAVAILABLE
                 )
 
-        # Successful authentication
+        # Generate a refresh token (for demonstration, using the same token as refresh_token)
+        refresh_token = token  # If you have a real refresh token implementation, replace this line
+
         return Response({
-            'id': user.id,
-            'username': user.username,
-            'email': user.email,
-            'role': user.user_type,
-            'token': token.key,
-            'force_password_change': user.force_password_change,
-            'first_name': user.first_name,
-            'is_verified': user.is_verified
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "role": user.user_type,
+            "token": token.key,
+            "refresh_token": refresh_token.key,  # Here, using the same token as refresh
+            "force_password_change": user.force_password_change,
+            "first_name": user.first_name,
+            "is_verified": user.is_verified
         }, status=status.HTTP_200_OK)
     
 
@@ -114,7 +125,22 @@ class StudentViewSet(viewsets.ModelViewSet):
         print("Returning students:", self.get_queryset())
         return super().list(request, *args, **kwargs)
 
-    def update(self, request, *args, **kwargs):  # <--- This method goes here in the ViewSet
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            self.perform_create(serializer)
+        except IntegrityError:
+            return Response(
+                {"detail": "A user with this email or username already exists."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+    def update(self, request, *args, **kwargs):
         partial = kwargs.pop('partial', False)
         instance = self.get_object()
         old_email = instance.email
@@ -140,7 +166,6 @@ class StudentViewSet(viewsets.ModelViewSet):
 
         return Response(serializer.data, status=status.HTTP_200_OK)
 
-
 class ForcePasswordChangeView(APIView):
     permission_classes = [IsAuthenticated]
     authentication_classes = [TokenAuthentication]
@@ -157,11 +182,13 @@ class ForcePasswordChangeView(APIView):
 class SubjectViewSet(viewsets.ModelViewSet):
     queryset = Subject.objects.all()
     serializer_class = SubjectSerializer
+    
 
 
 class QuestionViewSet(viewsets.ModelViewSet):
     queryset = Question.objects.all()
     serializer_class = QuestionSerializer
+    
 
     @action(detail=False, methods=['GET'])
     def download_format(self, request):
@@ -242,35 +269,34 @@ class QuestionViewSet(viewsets.ModelViewSet):
 class ExamViewSet(viewsets.ModelViewSet):
     queryset = Exam.objects.all()
     serializer_class = ExamSerializer
-    authentication_classes = [SessionAuthentication, TokenAuthentication]
+    authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         user = self.request.user
-        qs = super().get_queryset()
-        if user.is_authenticated and hasattr(user, 'user_type') and user.user_type == 'student':
-            return qs.filter(is_published=True)
-        return qs
+        if user.user_type == 'student':
+            return Exam.objects.filter(is_published=True)
+        return Exam.objects.all()
 
     @action(detail=True, methods=['POST'])
     def publish(self, request, pk=None):
         exam = self.get_object()
         exam.is_published = True
         exam.save()
-
-        students = User.objects.filter(user_type='student', is_active=True)
         message = request.data.get(
             'message',
-            f'A new exam "{exam.title}" has been scheduled. Please check your dashboard for details.'
+            f'A new exam "{exam.title}" has been scheduled.'
         )
+        students = User.objects.filter(user_type='student', is_active=True)
         for student in students:
-            send_mail(
-                subject=f"New Exam: {exam.title}",
-                message=message,
-                from_email=settings.DEFAULT_FROM_EMAIL,
-                recipient_list=[student.email],
-                fail_silently=True
-            )
+            if student.email:
+                send_mail(
+                    subject=f"New Exam: {exam.title}",
+                    message=message,
+                    from_email=settings.DEFAULT_FROM_EMAIL,
+                    recipient_list=[student.email],
+                    fail_silently=True,
+                )
         return Response({'status': 'published', 'recipients': students.count()})
 
     @action(detail=True, methods=['POST'])
@@ -279,18 +305,9 @@ class ExamViewSet(viewsets.ModelViewSet):
         exam.is_published = False
         exam.save()
         return Response({'status': 'unpublished'})
-    
 
-   # views.py
+
 class ExamSessionViewSet(viewsets.ModelViewSet):
-    """
-    Handles:
-      - create()            → POST /api/sessions/            (creates new session)
-      - validate_session()  → GET  /api/sessions/validate/<exam_id>/
-      - start_exam()        → POST /api/sessions/<pk>/start_exam/
-      - save_progress()     → POST /api/sessions/<pk>/save_progress/
-      - submit_exam()       → POST /api/sessions/<pk>/submit_exam/
-    """
     serializer_class = ExamSessionSerializer
     permission_classes = [IsAuthenticated]
     authentication_classes = [TokenAuthentication]
@@ -308,71 +325,84 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
         student = request.user
         exam_id = request.data.get('exam')
         if not exam_id:
-            return Response(
-                {'error': 'Exam field is required.'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({'error': 'Exam field is required.'}, status=400)
 
         exam = get_object_or_404(Exam, id=exam_id)
 
-        existing_session = ExamSession.objects.filter(
-            student=student,
-            exam=exam,
-            is_completed=False
-        ).first()
+        # Strict mode: only allow one completed attempt
+        if exam.mode == 'strict':
+            if ExamSession.objects.filter(student=student, exam=exam, is_completed=True).exists():
+                return Response(
+                    {'error': 'You have already attempted this exam. It is now closed.'},
+                    status=400
+                )
 
+        # Prevent multiple active sessions for strict exams
+        existing_session = ExamSession.objects.filter(
+            student=student, exam=exam, is_completed=False
+        ).first()
         if existing_session:
             return Response(
-                {'error': 'You already have an active session.'},
-                status=status.HTTP_400_BAD_REQUEST
+                {'error': 'You already have an active session for this exam.'},
+                status=400
             )
 
-        session = ExamSession.objects.create(
-            student=student,
-            exam=exam,
-            is_completed=False
-        )
+        session = ExamSession(student=student, exam=exam, is_completed=False)
+
+        try:
+            session.clean()  # validate model logic
+            session.save()
+        except ValidationError as e:
+            return Response({'error': str(e)}, status=400)
+
         serializer = self.get_serializer(session)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.data, status=201)
 
     @action(detail=False, methods=['GET'], url_path='validate/(?P<exam_id>[0-9]+)')
     def validate_session(self, request, exam_id=None):
-        """
-        If an active, incomplete session exists, return it.
-        Otherwise, create a new one.
-        """
         student = request.user
         exam = get_object_or_404(Exam, id=exam_id)
 
-        session = ExamSession.objects.filter(
-            student=student,
-            exam=exam,
-            is_completed=False
-        ).first()
+        try:
+            if exam.mode == 'strict':
+                if ExamSession.objects.filter(student=student, exam=exam, is_completed=True).exists():
+                    return Response(
+                        {'error': 'Your exam is already attempted. You cannot attempt again.'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
 
-        if not session:
-            try:
-                session = ExamSession.objects.create(
-                    student=student,
-                    exam=exam,
-                    is_completed=False
-                )
-            except IntegrityError:
-                # Another thread/request created it first—fetch the existing one
-                session = ExamSession.objects.get(student=student, exam=exam)
+            session = ExamSession.objects.filter(
+                student=student, exam=exam, is_completed=False
+            ).first()
 
-        serializer = self.get_serializer(session)
-        return Response(serializer.data)
+            if not session:
+                session = ExamSession(student=student, exam=exam, is_completed=False)
+                session.clean()
+                session.save()
+
+            serializer = self.get_serializer(session)
+            return Response(serializer.data)
+
+        except ValidationError as e:
+            logger.error(f"[SessionValidationError] {str(e)}")
+            return Response(
+                {'error': 'Validation error: ' + str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            logger.error(f"[SessionValidationError] {str(e)}")
+            return Response(
+                {'error': 'Unable to validate or create a new exam session.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    # ... Your other actions like start_exam, save_progress, submit_exam remain unchanged
 
     @action(detail=True, methods=['POST'])
     def start_exam(self, request, pk=None):
-        """
-        Marks the session’s start_time if not already set.
-        """
         session = self.get_object()
         if session.student != request.user:
-            raise PermissionDenied("You do not own this session.")
-
+            raise PermissionDenied("Invalid session owner")
         if not session.start_time:
             session.start_time = timezone.now()
             session.save()
@@ -380,20 +410,15 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['POST'], url_path='save_progress')
     def save_progress(self, request, pk=None):
-        """
-        Saves intermediate answers + elapsed_time. 
-        Expects payload: { "elapsed_time": <seconds>, "answers": [ { question: <id>, selected_answers: "A,C" }, … ] }
-        """
         session = self.get_object()
         user = request.user
 
         if session.student != user:
             raise PermissionDenied("Invalid session owner")
 
-        # We do not allow saving if already completed
         if session.is_completed:
             return Response(
-                {'error': 'Cannot save—exam already submitted.'},
+                {'error': 'Cannot save. This exam has already been submitted.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -401,62 +426,55 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
         elapsed_time = request.data.get('elapsed_time', 0)
 
         if not isinstance(answers_data, list):
-            raise ValidationError("`answers` must be a list of answer objects.")
+            return Response({'error': '`answers` must be a list of answer objects.'}, status=400)
 
-        # Overwrite any existing saved answers for this session
         Answer.objects.filter(session=session).delete()
 
         for answer_data in answers_data:
             question_id = answer_data.get('question')
             selected_answers = answer_data.get('selected_answers', '')
+            if not question_id:
+                continue
             Answer.objects.create(
                 session=session,
                 question_id=question_id,
                 selected_answers=selected_answers
             )
 
-        # Save elapsed_time to the session
         session.elapsed_time = elapsed_time
         session.save()
-
         return Response({'status': 'progress saved'}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['POST'])
     def submit_exam(self, request, pk=None):
-        """
-        Final submission. Calculates score, marks session complete.
-        """
         session = self.get_object()
         user = request.user
 
         if session.student != user:
             raise PermissionDenied("Invalid session owner")
-
         if session.is_completed:
-            return Response(
-                {'error': 'Exam already submitted'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({'error': 'Exam already submitted.'}, status=400)
 
         answers_data = request.data.get('answers', [])
         elapsed_time = request.data.get('elapsed_time', 0)
+        termination_reason = request.data.get('termination_reason', None)
 
         if not isinstance(answers_data, list):
-            raise ValidationError("`answers` must be a list of answer objects.")
+            return Response({'error': '`answers` must be a list of answer objects.'}, status=400)
 
-        # Overwrite any existing answers
         Answer.objects.filter(session=session).delete()
 
         for answer_data in answers_data:
             question_id = answer_data.get('question')
             selected_answers = answer_data.get('selected_answers', '')
+            if not question_id:
+                continue
             Answer.objects.create(
                 session=session,
                 question_id=question_id,
                 selected_answers=selected_answers
             )
 
-        # Grading
         answers = Answer.objects.filter(session=session)
         total_marks = 0
         score = 0
@@ -467,11 +485,10 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
             total_marks += question.marks
             correct_set = set(question.correct_option.split(','))
             selected_set = set(answer.selected_answers.split(','))
-            is_correct = (correct_set == selected_set)
+            is_correct = correct_set == selected_set
             earned = question.marks if is_correct else 0
             if is_correct:
                 score += earned
-
             details[question.id] = {
                 'correct': list(correct_set),
                 'selected': list(selected_set),
@@ -489,9 +506,19 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
 
         session.end_time = timezone.now()
         session.is_completed = True
+        if termination_reason:
+            session.termination_reason = termination_reason
         session.save()
 
-        return Response(ResultSerializer(result).data, status=status.HTTP_200_OK)
+        return Response(ResultSerializer(result).data, status=200)
+
+    def destroy(self, request, *args, **kwargs):
+        session = self.get_object()
+        if session.student != request.user:
+            raise PermissionDenied("Invalid session owner")
+        session.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
 
 
 class AnswerViewSet(viewsets.ModelViewSet):

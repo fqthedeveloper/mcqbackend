@@ -1,5 +1,7 @@
 from django.db import models
+from django.db.models import Q
 from django.contrib.auth.models import AbstractUser, Group, Permission
+from django.forms import ValidationError
 from django.utils import timezone
 
 
@@ -102,12 +104,29 @@ class ExamSession(models.Model):
     start_time = models.DateTimeField(auto_now_add=True)
     end_time = models.DateTimeField(null=True, blank=True)
     is_completed = models.BooleanField(default=False)
-    
+    termination_reason = models.TextField(null=True, blank=True)
+    elapsed_time = models.PositiveIntegerField(default=0)
+
     class Meta:
         unique_together = [('student', 'exam')]
-    
+
+    def clean(self):
+        # Enforce only one active session for strict mode
+        if self.exam.mode == 'strict' and not self.is_completed:
+            qs = ExamSession.objects.filter(
+                student=self.student,
+                exam=self.exam,
+                is_completed=False
+            )
+            if self.pk:
+                qs = qs.exclude(pk=self.pk)
+            if qs.exists():
+                raise ValidationError(
+                    "You already have an active strict exam session for this exam."
+                )
+
     def __str__(self):
-        return f"{self.student.email} - {self.exam.title}"
+        return f"{self.student.email} - {self.exam.title}" 
 
 class Answer(models.Model):
     session = models.ForeignKey(ExamSession, on_delete=models.CASCADE)
@@ -124,7 +143,7 @@ class Result(models.Model):
     session = models.OneToOneField(ExamSession, on_delete=models.CASCADE)
     score = models.PositiveIntegerField()
     total_marks = models.PositiveIntegerField()
-    details = models.JSONField()  # {question_id: {"correct": ["A"], "selected": ["A"], "is_correct": true}}
+    details = models.JSONField()  
     
     def __str__(self):
         return f"Result: {self.session} - {self.score}/{self.total_marks}"

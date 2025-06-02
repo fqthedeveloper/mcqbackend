@@ -1,3 +1,5 @@
+from django.conf import settings
+from django.db import IntegrityError
 from rest_framework import serializers
 from .models import *
 from django.contrib.auth import authenticate
@@ -92,15 +94,19 @@ class StudentCreateSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         password = get_random_string(length=10)
-        user = User.objects.create_user(
-            email=validated_data['email'],
-            username=validated_data.get('username', validated_data['email']),
-            user_type='student',
-            password=password,
-            force_password_change=True,
-            first_name=validated_data['first_name'],
-            last_name=validated_data['last_name'],
-        )
+        try:
+            user = User.objects.create_user(
+                email=validated_data['email'],
+                username=validated_data.get('username', validated_data['email']),
+                user_type='student',
+                password=password,
+                force_password_change=True,
+                first_name=validated_data['first_name'],
+                last_name=validated_data['last_name'],
+            )
+        except IntegrityError as e:
+            # This handles database unique constraints like duplicate email or username
+            raise serializers.ValidationError({"detail": "A user with this email or username already exists."})
 
         send_mail(
             subject='Your IRT MCQ Webapp Student Account Login',
@@ -110,6 +116,7 @@ class StudentCreateSerializer(serializers.ModelSerializer):
                 f'Password: {password}\n\n'
                 'Please change your password after first login.'
             ),
+            from_email=settings.EMAIL_HOST_USER,
             recipient_list=[user.email],
             fail_silently=False,
         )
@@ -206,19 +213,27 @@ class ExamQuestionSerializer(serializers.ModelSerializer):
         model = ExamQuestion
         fields = ['id', 'question', 'order']
 
+
 class ExamSerializer(serializers.ModelSerializer):
     questions = ExamQuestionSerializer(source='examquestion_set', many=True, read_only=True)
     subject_name = serializers.CharField(source='subject.name', read_only=True)
     created_at = serializers.DateTimeField(format='%Y-%m-%d %H:%M:%S', read_only=True)
     updated_at = serializers.DateTimeField(format='%Y-%m-%d %H:%M:%S', read_only=True)
     question_count = serializers.SerializerMethodField()
-    
+    # Add this field to handle question IDs from frontend
+    selected_questions = serializers.ListField(
+        child=serializers.IntegerField(),
+        write_only=True,
+        required=False,
+        default=[]
+    )
+
     class Meta:
         model = Exam
         fields = [
             'id', 'title', 'subject', 'subject_name', 'mode', 'duration', 
             'start_time', 'end_time', 'is_published', 'created_at', 'updated_at',
-            'questions', 'question_count'
+            'questions', 'question_count', 'selected_questions'  
         ]
 
     def get_question_count(self, obj):
@@ -249,7 +264,6 @@ class ExamSerializer(serializers.ModelSerializer):
                     ExamQuestion.objects.create(exam=instance, question=question, order=order)
                 except Question.DoesNotExist:
                     continue
-
         return instance
 
 class ExamSessionSerializer(serializers.ModelSerializer):
