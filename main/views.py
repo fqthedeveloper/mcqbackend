@@ -215,53 +215,62 @@ class QuestionViewSet(viewsets.ModelViewSet):
         if not file:
             return Response({'status': 'error', 'message': 'No file uploaded'}, status=400)
 
-        required_columns = [
-            'Subject', 'Question',
-            'Option A', 'Option B', 'Option C', 'Option D',
-            'Correct Answers', 'Marks', 'Is Multi'
-        ]
-
         try:
             df = pd.read_excel(file)
         except Exception as e:
             return Response({'status': 'error', 'message': f'Failed to read Excel file: {str(e)}'}, status=400)
 
+        required_columns = [
+            'Subject', 'Question',
+            'Option A', 'Option B', 'Option C', 'Option D',
+            'Correct Answers', 'Marks', 'Is Multi'
+        ]
         missing_cols = [col for col in required_columns if col not in df.columns]
         if missing_cols:
-            return Response({
-                'status': 'error',
-                'message': f'Missing columns: {", ".join(missing_cols)}'
-            }, status=400)
+            return Response({'status': 'error', 'message': f'Missing columns: {", ".join(missing_cols)}'}, status=400)
 
         try:
             with transaction.atomic():
-                for _, row in df.iterrows():
-                    subject_obj, _ = Subject.objects.get_or_create(name=row['Subject'])
+                for idx, row in df.iterrows():
+                    raw_subject = row['Subject']
+                    # ① Skip or error if Subject is blank/NaN
+                    if pd.isna(raw_subject) or str(raw_subject).strip() == '':
+                        raise ValueError(f"Row {idx+2}: 'Subject' cannot be blank.")
 
+                    # ② Create or get the Subject
+                    subject_obj, _ = Subject.objects.get_or_create(name=str(raw_subject).strip())
+
+                    # ③ Validate “Correct Answers”
                     correct_answers = str(row['Correct Answers']).replace(' ', '').upper()
-
                     is_multi_val = row['Is Multi']
                     is_multi = str(is_multi_val).strip().lower() in ['true', '1', 'yes']
 
                     if is_multi:
-                        if not all(opt in ['A', 'B', 'C', 'D'] for opt in correct_answers.split(',')):
-                            raise ValueError(f"Invalid correct options in row: {correct_answers}")
+                        # for multiple correct, comma‐separated, e.g. “A,B”
+                        for opt in correct_answers.split(','):
+                            if opt not in ['A', 'B', 'C', 'D']:
+                                raise ValueError(f"Row {idx+2}: invalid correct option '{opt}'.")
                     else:
                         if correct_answers not in ['A', 'B', 'C', 'D']:
-                            raise ValueError(f"Invalid single correct option in row: {correct_answers}")
+                            raise ValueError(f"Row {idx+2}: invalid single correct answer '{correct_answers}'.")
 
+                    # ④ Create the Question record
                     Question.objects.create(
                         subject=subject_obj,
-                        text=row['Question'],
-                        option_a=row['Option A'],
-                        option_b=row['Option B'],
-                        option_c=row['Option C'],
-                        option_d=row['Option D'],
+                        text=str(row['Question']).strip(),
+                        option_a=str(row['Option A']).strip(),
+                        option_b=str(row['Option B']).strip(),
+                        option_c=str(row['Option C']).strip(),
+                        option_d=str(row['Option D']).strip(),
                         correct_option=correct_answers,
                         marks=int(row['Marks']),
                         is_multi=is_multi
                     )
-            return Response({'status': 'success', 'message': 'Questions uploaded successfully'})
+
+                return Response({'status': 'success', 'message': 'Questions uploaded successfully'})
+        except ValueError as ve:
+            # Return a clear message about exactly which row failed and why
+            return Response({'status': 'error', 'message': str(ve)}, status=400)
         except Exception as e:
             return Response({'status': 'error', 'message': str(e)}, status=400)
 
