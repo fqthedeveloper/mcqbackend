@@ -12,6 +12,7 @@ class User(AbstractUser):
         ('student', 'Student'),
     )
     user_type = models.CharField(max_length=10, choices=USER_TYPES)
+    
     is_verified = models.BooleanField(default=False)
     force_password_change = models.BooleanField(default=True)
     email = models.EmailField(unique=True)
@@ -39,6 +40,11 @@ class User(AbstractUser):
     )
 
 
+class EmailOTP(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE)
+    otp = models.CharField(max_length=6)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
 
 class Subject(models.Model):
     name = models.CharField(max_length=100)
@@ -96,7 +102,7 @@ class ExamQuestion(models.Model):
         unique_together = [('exam', 'question')]
         
     def __str__(self):
-        return f"{self.exam.title} - Q{self.order}"
+        return f"{self.exam.title} - {self.order}"
 
 class ExamSession(models.Model):
     student = models.ForeignKey(User, on_delete=models.CASCADE)
@@ -109,22 +115,7 @@ class ExamSession(models.Model):
 
     class Meta:
         unique_together = [('student', 'exam')]
-
-    def clean(self):
-        # Enforce only one active session for strict mode
-        if self.exam.mode == 'strict' and not self.is_completed:
-            qs = ExamSession.objects.filter(
-                student=self.student,
-                exam=self.exam,
-                is_completed=False
-            )
-            if self.pk:
-                qs = qs.exclude(pk=self.pk)
-            if qs.exists():
-                raise ValidationError(
-                    "You already have an active strict exam session for this exam."
-                )
-
+        
     def __str__(self):
         return f"{self.student.email} - {self.exam.title}" 
 
