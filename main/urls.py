@@ -3,8 +3,8 @@ from rest_framework import routers
 from .views import (
     UserViewSet, SubjectViewSet, QuestionViewSet,
     ExamViewSet, ExamSessionViewSet, AnswerViewSet,
-    ResultViewSet, StudentViewSet,
-    LoginView, ForcePasswordChangeView
+    ResultViewSet, StudentViewSet, SendOTPView,
+    LoginView, ForcePasswordChangeView, VerifyOTPView
 )
 
 router = routers.DefaultRouter()
@@ -25,4 +25,6 @@ urlpatterns = [
     path('exams/<int:pk>/unpublish/', ExamViewSet.as_view({'post': 'unpublish'}), name='exam-unpublish'),
     path('sessions/<int:pk>/start/', ExamSessionViewSet.as_view({'post': 'start_exam'}), name='session-start'),
     path('sessions/<int:pk>/submit/', ExamSessionViewSet.as_view({'post': 'submit_exam'}), name='session-submit'),
+    path('send-otp/', SendOTPView.as_view(), name='send_otp'),
+    path('verify-otp/', VerifyOTPView.as_view(), name='verify_otp'),
 ]
