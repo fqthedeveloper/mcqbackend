@@ -71,27 +71,71 @@ class Question(models.Model):
         return self.text  
 
 
-
 class Exam(models.Model):
     MODE_CHOICES = (
         ('practice', 'Practice'),
         ('strict', 'Strict'),
+        ('practical', 'Practical'),
     )
-    
     title = models.CharField(max_length=200)
-    subject = models.ForeignKey(Subject, on_delete=models.CASCADE)
+    subject = models.ForeignKey('Subject', on_delete=models.CASCADE)
     mode = models.CharField(max_length=10, choices=MODE_CHOICES, default='practice')
     duration = models.PositiveIntegerField(help_text="Duration in minutes")
     start_time = models.DateTimeField(null=True, blank=True)
     end_time = models.DateTimeField(null=True, blank=True)
-    questions = models.ManyToManyField(Question, through='ExamQuestion')
+    questions = models.ManyToManyField('Question', through='ExamQuestion')
+    practical_tasks = models.ManyToManyField('PracticalTask', through='ExamPracticalTask')
     is_published = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     
     def __str__(self):
         return self.title
+    
+    def clean(self):
+        if self.mode == 'practical' and self.questions.exists():
+            raise ValidationError("Practical exams cannot have MCQ questions")
 
+class PracticalTask(models.Model):
+    title = models.CharField(max_length=200)
+    description = models.TextField()
+    command_template = models.TextField(help_text="Template command for the task")
+    expected_output = models.TextField(help_text="Expected output pattern (regex)")
+    marks = models.PositiveIntegerField(default=10)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.title
+
+class ExamPracticalTask(models.Model):
+    exam = models.ForeignKey(Exam, on_delete=models.CASCADE)
+    task = models.ForeignKey(PracticalTask, on_delete=models.CASCADE)
+    order = models.PositiveIntegerField(default=0)
+    
+    class Meta:
+        ordering = ['order']
+        unique_together = [('exam', 'task')]
+        
+    def __str__(self):
+        return f"{self.exam.title} - {self.order}"
+
+class ExamSession(models.Model):
+    student = models.ForeignKey('User', on_delete=models.CASCADE)
+    exam = models.ForeignKey(Exam, on_delete=models.CASCADE)
+    start_time = models.DateTimeField(auto_now_add=True)
+    end_time = models.DateTimeField(null=True, blank=True)
+    is_completed = models.BooleanField(default=False)
+    termination_reason = models.TextField(null=True, blank=True)
+    elapsed_time = models.PositiveIntegerField(default=0)
+    terminal_output = models.TextField(blank=True, null=True)
+
+    class Meta:
+        unique_together = [('student', 'exam')]
+        
+    def __str__(self):
+        return f"{self.student.email} - {self.exam.title}"
+    
 class ExamQuestion(models.Model):
     exam = models.ForeignKey(Exam, on_delete=models.CASCADE)
     question = models.ForeignKey(Question, on_delete=models.CASCADE)
@@ -104,20 +148,18 @@ class ExamQuestion(models.Model):
     def __str__(self):
         return f"{self.exam.title} - {self.order}"
 
-class ExamSession(models.Model):
-    student = models.ForeignKey(User, on_delete=models.CASCADE)
-    exam = models.ForeignKey(Exam, on_delete=models.CASCADE)
-    start_time = models.DateTimeField(auto_now_add=True)
-    end_time = models.DateTimeField(null=True, blank=True)
-    is_completed = models.BooleanField(default=False)
-    termination_reason = models.TextField(null=True, blank=True)
-    elapsed_time = models.PositiveIntegerField(default=0)
-
+class PracticalAnswer(models.Model):
+    session = models.ForeignKey(ExamSession, on_delete=models.CASCADE)
+    task = models.ForeignKey(PracticalTask, on_delete=models.CASCADE)
+    command_used = models.TextField()
+    output = models.TextField()
+    is_verified = models.BooleanField(default=False)
+    
     class Meta:
-        unique_together = [('student', 'exam')]
-        
+        unique_together = [('session', 'task')]
+    
     def __str__(self):
-        return f"{self.student.email} - {self.exam.title}" 
+        return f"Answer for {self.task}"
 
 class Answer(models.Model):
     session = models.ForeignKey(ExamSession, on_delete=models.CASCADE)

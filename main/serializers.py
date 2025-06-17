@@ -216,14 +216,34 @@ class ExamQuestionSerializer(serializers.ModelSerializer):
         model = ExamQuestion
         fields = ['id', 'question', 'order']
 
+class PracticalTaskSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PracticalTask
+        fields = '__all__'
+
+class ExamPracticalTaskSerializer(serializers.ModelSerializer):
+    task = PracticalTaskSerializer()
+    
+    class Meta:
+        model = ExamPracticalTask
+        fields = ['id', 'task', 'order']
+
 
 class ExamSerializer(serializers.ModelSerializer):
     questions = serializers.SerializerMethodField()
+    practical_tasks = serializers.SerializerMethodField()
     subject_name = serializers.CharField(source='subject.name', read_only=True)
     created_at = serializers.DateTimeField(format='%Y-%m-%d %H:%M:%S', read_only=True)
     updated_at = serializers.DateTimeField(format='%Y-%m-%d %H:%M:%S', read_only=True)
     question_count = serializers.SerializerMethodField()
+    task_count = serializers.SerializerMethodField()
     selected_questions = serializers.ListField(
+        child=serializers.IntegerField(),
+        write_only=True,
+        required=False,
+        default=[]
+    )
+    selected_tasks = serializers.ListField(
         child=serializers.IntegerField(),
         write_only=True,
         required=False,
@@ -235,28 +255,47 @@ class ExamSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'title', 'subject', 'subject_name', 'mode', 'duration', 
             'start_time', 'end_time', 'is_published', 'created_at', 'updated_at',
-            'questions', 'question_count', 'selected_questions'
+            'questions', 'practical_tasks', 'question_count', 'task_count',
+            'selected_questions', 'selected_tasks'
         ]
 
     def get_questions(self, obj):
         return ExamQuestionSerializer(obj.examquestion_set.all(), many=True).data
+        
+    def get_practical_tasks(self, obj):
+        return ExamPracticalTaskSerializer(obj.exampracticaltask_set.all(), many=True).data
 
     def get_question_count(self, obj):
         return obj.examquestion_set.count()
+        
+    def get_task_count(self, obj):
+        return obj.exampracticaltask_set.count()
 
     def create(self, validated_data):
         selected_questions = validated_data.pop('selected_questions', [])
+        selected_tasks = validated_data.pop('selected_tasks', [])
         exam = Exam.objects.create(**validated_data)
+        
         for order, question_id in enumerate(selected_questions):
             try:
                 question = Question.objects.get(id=question_id)
                 ExamQuestion.objects.create(exam=exam, question=question, order=order)
             except Question.DoesNotExist:
                 continue
+        
+        for order, task_id in enumerate(selected_tasks):
+            try:
+                task = PracticalTask.objects.get(id=task_id)
+                ExamPracticalTask.objects.create(exam=exam, task=task, order=order)
+            except PracticalTask.DoesNotExist:
+                continue
+                
         return exam
 
     def update(self, instance, validated_data):
         selected_questions = validated_data.pop('selected_questions', None)
+        selected_tasks = validated_data.pop('selected_tasks', None)
+        
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save()
@@ -269,16 +308,44 @@ class ExamSerializer(serializers.ModelSerializer):
                     ExamQuestion.objects.create(exam=instance, question=question, order=order)
                 except Question.DoesNotExist:
                     continue
+                    
+        if selected_tasks is not None:
+            instance.exampracticaltask_set.all().delete()
+            for order, task_id in enumerate(selected_tasks):
+                try:
+                    task = PracticalTask.objects.get(id=task_id)
+                    ExamPracticalTask.objects.create(exam=instance, task=task, order=order)
+                except PracticalTask.DoesNotExist:
+                    continue
+                    
         return instance
+
+class PracticalAnswerSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PracticalAnswer
+        fields = '__all__'
 
 class ExamSessionSerializer(serializers.ModelSerializer):
     exam_title = serializers.CharField(source='exam.title', read_only=True)
+    exam_mode = serializers.CharField(source='exam.mode', read_only=True)
+    exam_duration = serializers.IntegerField(source='exam.duration', read_only=True)
     student_name = serializers.CharField(source='student.get_full_name', read_only=True)
+    practical_tasks = serializers.SerializerMethodField()
     
     class Meta:
         model = ExamSession
-        fields = '__all__'
+        fields = [
+            'id', 'exam', 'exam_title', 'exam_mode', 'exam_duration', 'student',
+            'student_name', 'start_time', 'end_time', 'is_completed', 'elapsed_time',
+            'terminal_output', 'termination_reason', 'practical_tasks'
+        ]
         read_only_fields = ['start_time', 'end_time', 'is_completed']
+    
+    def get_practical_tasks(self, obj):
+        if obj.exam.mode == 'practical':
+            tasks = obj.exam.exampracticaltask_set.all().order_by('order')
+            return ExamPracticalTaskSerializer(tasks, many=True).data
+        return None
 
 class AnswerSerializer(serializers.ModelSerializer):
     class Meta:
@@ -292,3 +359,4 @@ class ResultSerializer(serializers.ModelSerializer):
     class Meta:
         model = Result
         fields = '__all__'
+    

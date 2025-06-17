@@ -1,4 +1,9 @@
+import csv
+import io
+import json
+from tkinter.font import Font
 from django.shortcuts import get_object_or_404
+from openpyxl import Workbook
 from rest_framework import viewsets, status
 from rest_framework.response import Response
 from rest_framework.decorators import action
@@ -6,7 +11,7 @@ from .models import *
 from .serializers import *
 from .utils import process_excel
 from django.utils import timezone
-from django.http import HttpResponse
+from django.http import Http404, HttpResponse
 import pandas as pd
 from django.db.models import Q
 from rest_framework.views import APIView
@@ -17,10 +22,13 @@ from django.db import IntegrityError, transaction
 from rest_framework.permissions import IsAuthenticated
 from .permissions import IsAdminUserOnly
 from rest_framework.authentication import TokenAuthentication
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError as DRFValidationError
 from django.conf import settings
 import random
-
+import re
+from channels.generic.websocket import AsyncWebsocketConsumer
+import subprocess
+from asgiref.sync import sync_to_async
 
 User = get_user_model()
 
@@ -288,6 +296,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         exam.is_published = False
         exam.save()
         return Response({'status': 'unpublished'})
+    
 
 class ExamSessionViewSet(viewsets.ModelViewSet):
     serializer_class = ExamSessionSerializer
@@ -296,97 +305,171 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        qs = ExamSession.objects.all()
-        if user.user_type == 'student':
-            return qs.filter(student=user)
+        if user.is_superuser:
+            return ExamSession.objects.all()
+        elif user.user_type == 'student':
+            return ExamSession.objects.filter(student=user)
         elif user.user_type == 'teacher':
-            return qs.filter(exam__subject__teacher=user)
-        return qs
+            return ExamSession.objects.filter(exam__subject__teacher=user)
+        return ExamSession.objects.none()
+
+    def get_object(self):
+        try:
+            return super().get_object()
+        except Http404:
+            user = self.request.user
+            session_id = self.kwargs['pk']
+            exam_id = self.request.query_params.get('exam_id')
+            
+            if not exam_id:
+                logger.warning("Missing exam_id for session creation")
+                raise DRFValidationError(
+                    {'error': 'exam_id parameter is required'},
+                    code=status.HTTP_400_BAD_REQUEST
+                )
+            
+            try:
+                exam = Exam.objects.get(id=exam_id)
+                if exam.mode == 'practical':
+                    return self.create_practical_session(user, exam, session_id)
+                else:
+                    logger.warning("Invalid exam mode for session creation")
+                    raise DRFValidationError(
+                        {'error': 'Only practical exams can be created this way'},
+                        code=status.HTTP_400_BAD_REQUEST
+                    )
+            except Exam.DoesNotExist:
+                logger.warning("Exam not found")
+                raise DRFValidationError(
+                    {'error': 'Exam not found'},
+                    code=status.HTTP_404_NOT_FOUND
+                )
+
+    def create_practical_session(self, user, exam, session_id=None):
+        if exam.mode == 'strict':
+            if ExamSession.objects.filter(student=user, exam=exam, is_completed=True).exists():
+                raise DRFValidationError(
+                    {'error': 'Strict exam already completed'},
+                    code=status.HTTP_400_BAD_REQUEST
+                )
+
+        try:
+            existing_session = ExamSession.objects.get(id=session_id)
+            if existing_session.student != user:
+                raise PermissionDenied("Session already exists for another user")
+            return existing_session
+        except ExamSession.DoesNotExist:
+            pass
+
+        session = ExamSession(
+            id=session_id,
+            student=user,
+            exam=exam,
+            is_completed=False
+        )
+
+        try:
+            session.full_clean()
+            session.save()
+            return session
+        except Exception as e:
+            raise DRFValidationError(
+                {'error': str(e)},
+                code=status.HTTP_400_BAD_REQUEST
+            )
+
+    @action(detail=False, methods=['post'], url_path='validate-exam')
+    def validate_exam_session(self, request):
+        student = request.user
+        exam_id = request.data.get('exam')
+        
+        if not exam_id:
+            return Response(
+                {'error': 'Exam ID is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            exam = Exam.objects.get(id=exam_id)
+        except Exam.DoesNotExist:
+            return Response(
+                {'error': 'Exam not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Check for existing active session
+        existing_session = ExamSession.objects.filter(
+            student=student, 
+            exam=exam, 
+            is_completed=False
+        ).first()
+        
+        if existing_session:
+            serializer = self.get_serializer(existing_session)
+            return Response(serializer.data)
+
+        # Create new session
+        session = ExamSession(student=student, exam=exam, is_completed=False)
+        try:
+            session.full_clean()
+            session.save()
+        except Exception as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        serializer = self.get_serializer(session)
+        return Response(serializer.data)
 
     def create(self, request, *args, **kwargs):
         student = request.user
         exam_id = request.data.get('exam')
         if not exam_id:
-            return Response({'error': 'Exam required'}, status=400)
-
-        exam = get_object_or_404(Exam, id=exam_id)
-
-        # Strict mode: only allow one completed attempt
-        if exam.mode == 'strict':
-            if ExamSession.objects.filter(student=student, exam=exam, is_completed=True).exists():
-                return Response(
-                    {'error': 'Strict exam already completed. No retries allowed.'},
-                    status=400
-                )
-
-        # Prevent multiple active sessions
-        existing_session = ExamSession.objects.filter(
-            student=student, exam=exam, is_completed=False
-        ).first()
-        if existing_session:
-            return Response(
-                {'error': 'Active session already exists for this exam'},
-                status=400
-            )
-
-        session = ExamSession(student=student, exam=exam, is_completed=False)
+            return Response({'error': 'Exam required'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            session.clean()
+            exam = Exam.objects.get(id=exam_id)
+        except Exam.DoesNotExist:
+            return Response({'error': 'Exam not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Check for existing active session
+        existing_session = ExamSession.objects.filter(
+            student=student, 
+            exam=exam, 
+            is_completed=False
+        ).first()
+        
+        if existing_session:
+            serializer = self.get_serializer(existing_session)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        # Create new session
+        session = ExamSession(student=student, exam=exam, is_completed=False)
+        try:
+            session.full_clean()
             session.save()
-        except ValidationError as e:
-            return Response({'error': str(e)}, status=400)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
         serializer = self.get_serializer(session)
-        return Response(serializer.data, status=201)
-
-    @action(detail=False, methods=['GET'], url_path='validate/(?P<exam_id>[0-9]+)')
-    def validate_session(self, request, exam_id=None):
-        student = request.user
-        exam = get_object_or_404(Exam, id=exam_id)
-
-        try:
-            if exam.mode == 'strict':
-                if ExamSession.objects.filter(student=student, exam=exam, is_completed=True).exists():
-                    return Response(
-                        {'error': 'Strict exam already completed. No retries allowed.'},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-
-            session = ExamSession.objects.filter(
-                student=student, exam=exam, is_completed=False
-            ).first()
-
-            if not session:
-                session = ExamSession(student=student, exam=exam, is_completed=False)
-                session.clean()
-                session.save()
-
-            serializer = self.get_serializer(session)
-            return Response(serializer.data)
-
-        except ValidationError as e:
-            logger.error(f"[SessionValidationError] {str(e)}")
-            return Response(
-                {'error': 'Validation error: ' + str(e)},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        except Exception as e:
-            logger.error(f"[SessionValidationError] {str(e)}")
-            return Response(
-                {'error': 'Unable to validate session'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['POST'])
     def start_exam(self, request, pk=None):
-        session = self.get_object()
-        if session.student != request.user:
-            raise PermissionDenied("Invalid session owner")
-        if not session.start_time:
-            session.start_time = timezone.now()
-            session.save()
-        return Response({'status': 'exam started'})
+        try:
+            session = self.get_object()
+            if session.student != request.user:
+                raise PermissionDenied("Invalid session owner")
+            if not session.start_time:
+                session.start_time = timezone.now()
+                session.save()
+            return Response({'status': 'exam started'})
+        except ExamSession.DoesNotExist:
+            return Response(
+                {'error': 'Session not found'}, 
+                status=status.HTTP_404_NOT_FOUND
+            )
 
     @action(detail=True, methods=['POST'], url_path='save_progress')
     def save_progress(self, request, pk=None):
@@ -406,24 +489,49 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
         elapsed_time = request.data.get('elapsed_time', 0)
 
         if not isinstance(answers_data, list):
-            return Response({'error': 'Answers must be a list'}, status=400)
-
-        Answer.objects.filter(session=session).delete()
-
-        for answer_data in answers_data:
-            question_id = answer_data.get('question')
-            selected_answers = answer_data.get('selected_answers', '')
-            if not question_id:
-                continue
-            Answer.objects.create(
-                session=session,
-                question_id=question_id,
-                selected_answers=selected_answers
+            return Response(
+                {'error': 'Answers must be a list'}, 
+                status=status.HTTP_400_BAD_REQUEST
             )
 
-        session.elapsed_time = elapsed_time
+        with transaction.atomic():
+            # Delete existing answers only if new ones are provided
+            if answers_data:
+                Answer.objects.filter(session=session).delete()
+
+            for answer_data in answers_data:
+                question_id = answer_data.get('question')
+                selected_answers = answer_data.get('selected_answers', '')
+                if not question_id:
+                    continue
+                Answer.objects.create(
+                    session=session,
+                    question_id=question_id,
+                    selected_answers=selected_answers
+                )
+
+            session.elapsed_time = elapsed_time
+            session.save()
+            
+        return Response({'status': 'progress saved'}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['POST'], url_path='save_terminal')
+    def save_terminal(self, request, pk=None):
+        session = self.get_object()
+        if session.student != request.user:
+            raise PermissionDenied("Invalid session owner")
+        
+        if session.is_completed:
+            return Response(
+                {'error': 'Exam already submitted'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        terminal_output = request.data.get('terminal_output', '')
+        session.terminal_output = terminal_output
         session.save()
-        return Response({'status': 'progress saved'}, status=200)
+        
+        return Response({'status': 'terminal output saved'})
 
     @action(detail=True, methods=['POST'])
     def submit_exam(self, request, pk=None):
@@ -433,64 +541,208 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
         if session.student != user:
             raise PermissionDenied("Invalid session owner")
         if session.is_completed:
-            return Response({'error': 'Exam already submitted'}, status=400)
+            return Response(
+                {'error': 'Exam already submitted'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
+        if session.exam.mode == 'practical':
+            return self._submit_practical_exam(session, request)
+        else:
+            return self._submit_mcq_exam(session, request)
+
+    def _submit_practical_exam(self, session, request):
+        terminal_output = request.data.get('terminal_output', '')
+        session.terminal_output = terminal_output
+        
+        answers = PracticalAnswer.objects.filter(session=session).select_related('task')
+        total_marks = 0
+        score = 0
+        details = {}
+        
+        with transaction.atomic():
+            for answer in answers:
+                task = answer.task
+                total_marks += task.marks
+                
+                try:
+                    pattern = re.compile(task.expected_output)
+                    is_verified = bool(pattern.search(answer.output))
+                except re.error:
+                    is_verified = False
+                    
+                earned = task.marks if is_verified else 0
+                score += earned
+                
+                answer.is_verified = is_verified
+                answer.save()
+                
+                details[task.id] = {
+                    'command_used': answer.command_used,
+                    'output': answer.output,
+                    'expected_output': task.expected_output,
+                    'is_verified': is_verified,
+                    'marks': task.marks,
+                    'earned': earned
+                }
+            
+            result = Result.objects.create(
+                session=session,
+                score=score,
+                total_marks=total_marks,
+                details=details
+            )
+            
+            session.end_time = timezone.now()
+            session.is_completed = True
+            session.save()
+        
+        return Response(ResultSerializer(result).data, status=status.HTTP_200_OK)
+
+    def _submit_mcq_exam(self, session, request):
         answers_data = request.data.get('answers', [])
         elapsed_time = request.data.get('elapsed_time', 0)
         termination_reason = request.data.get('termination_reason', None)
 
         if not isinstance(answers_data, list):
-            return Response({'error': 'Answers must be a list'}, status=400)
-
-        Answer.objects.filter(session=session).delete()
-
-        for answer_data in answers_data:
-            question_id = answer_data.get('question')
-            selected_answers = answer_data.get('selected_answers', '')
-            if not question_id:
-                continue
-            Answer.objects.create(
-                session=session,
-                question_id=question_id,
-                selected_answers=selected_answers
+            return Response(
+                {'error': 'Answers must be a list'}, 
+                status=status.HTTP_400_BAD_REQUEST
             )
 
-        answers = Answer.objects.filter(session=session)
-        total_marks = 0
-        score = 0
-        details = {}
+        with transaction.atomic():
+            # Delete existing answers only if new ones are provided
+            if answers_data:
+                Answer.objects.filter(session=session).delete()
 
-        for answer in answers:
-            question = answer.question
-            total_marks += question.marks
-            correct_set = set(question.correct_option.split(','))
-            selected_set = set(answer.selected_answers.split(','))
-            is_correct = correct_set == selected_set
-            earned = question.marks if is_correct else 0
-            if is_correct:
-                score += earned
-            details[question.id] = {
-                'correct': list(correct_set),
-                'selected': list(selected_set),
-                'is_correct': is_correct,
-                'marks': question.marks,
-                'earned': earned
-            }
+            for answer_data in answers_data:
+                question_id = answer_data.get('question')
+                selected_answers = answer_data.get('selected_answers', '')
+                if not question_id:
+                    continue
+                Answer.objects.create(
+                    session=session,
+                    question_id=question_id,
+                    selected_answers=selected_answers
+                )
 
-        result = Result.objects.create(
-            session=session,
-            score=score,
-            total_marks=total_marks,
-            details=details
+            answers = Answer.objects.filter(session=session).select_related('question')
+            total_marks = 0
+            score = 0
+            details = {}
+
+            for answer in answers:
+                question = answer.question
+                total_marks += question.marks
+                correct_set = set(question.correct_option.split(','))
+                selected_set = set(answer.selected_answers.split(','))
+                is_correct = correct_set == selected_set
+                earned = question.marks if is_correct else 0
+                if is_correct:
+                    score += earned
+                details[question.id] = {
+                    'correct': list(correct_set),
+                    'selected': list(selected_set),
+                    'is_correct': is_correct,
+                    'marks': question.marks,
+                    'earned': earned
+                }
+
+            result = Result.objects.create(
+                session=session,
+                score=score,
+                total_marks=total_marks,
+                details=details
+            )
+
+            session.end_time = timezone.now()
+            session.is_completed = True
+            session.elapsed_time = elapsed_time
+            if termination_reason:
+                session.termination_reason = termination_reason
+            session.save()
+
+        return Response(ResultSerializer(result).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['GET'], url_path='download_answers')
+    def download_answers(self, request, pk=None):
+        session = self.get_object()
+        
+        if session.student != request.user and request.user.user_type != 'teacher':
+            return Response(
+                {'error': 'Permission denied'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        if session.exam.mode == 'practical':
+            answers = PracticalAnswer.objects.filter(session=session).select_related('task')
+        else:
+            answers = Answer.objects.filter(session=session).select_related('question')
+        
+        response = HttpResponse(
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
-
-        session.end_time = timezone.now()
-        session.is_completed = True
-        if termination_reason:
-            session.termination_reason = termination_reason
-        session.save()
-
-        return Response(ResultSerializer(result).data, status=200)
+        filename = f"{session.exam.title}_{session.student.username}_answers.xlsx"
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = "Exam Answers"
+        
+        if session.exam.mode == 'practical':
+            headers = [
+                'Task Title', 'Description', 'Command Used', 
+                'Output', 'Expected Output', 'Marks', 'Status'
+            ]
+            for col_num, header in enumerate(headers, 1):
+                cell = worksheet.cell(row=1, column=col_num, value=header)
+                cell.font = Font(bold=True)
+            
+            for row_num, answer in enumerate(answers, 2):
+                worksheet.cell(row=row_num, column=1, value=answer.task.title)
+                worksheet.cell(row=row_num, column=2, value=answer.task.description)
+                worksheet.cell(row=row_num, column=3, value=answer.command_used)
+                worksheet.cell(row=row_num, column=4, value=answer.output)
+                worksheet.cell(row=row_num, column=5, value=answer.task.expected_output)
+                worksheet.cell(row=row_num, column=6, value=answer.task.marks)
+                worksheet.cell(row=row_num, column=7, value='Verified' if answer.is_verified else 'Pending')
+        else:
+            headers = [
+                'Question', 'Selected Answers', 'Correct Answers', 
+                'Status', 'Marks', 'Earned'
+            ]
+            for col_num, header in enumerate(headers, 1):
+                cell = worksheet.cell(row=1, column=col_num, value=header)
+                cell.font = Font(bold=True)
+            
+            for row_num, answer in enumerate(answers, 2):
+                question = answer.question
+                correct_set = set(question.correct_option.split(','))
+                selected_set = set(answer.selected_answers.split(','))
+                is_correct = correct_set == selected_set
+                
+                worksheet.cell(row=row_num, column=1, value=question.text)
+                worksheet.cell(row=row_num, column=2, value=answer.selected_answers)
+                worksheet.cell(row=row_num, column=3, value=question.correct_option)
+                worksheet.cell(row=row_num, column=4, value='Correct' if is_correct else 'Incorrect')
+                worksheet.cell(row=row_num, column=5, value=question.marks)
+                worksheet.cell(row=row_num, column=6, value=question.marks if is_correct else 0)
+        
+        for col in worksheet.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(cell.value)
+                except:
+                    pass
+            adjusted_width = (max_length + 2)
+            worksheet.column_dimensions[column].width = adjusted_width
+        
+        workbook.save(response)
+        return response
+    
     
 class AnswerViewSet(viewsets.ModelViewSet):
     serializer_class = AnswerSerializer
@@ -670,3 +922,132 @@ class GetStudentEmailView(APIView):
             return Response({'email': student.email})
         except User.DoesNotExist:
             return Response({'error': 'Student not found'}, status=404)
+
+
+
+class PracticalTaskViewSet(viewsets.ModelViewSet):
+    queryset = PracticalTask.objects.all()
+    serializer_class = PracticalTaskSerializer
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+    
+    @action(detail=False, methods=['GET'])
+    def download_format(self, request):
+        data = {
+            'Title': ['Task 1', 'Task 2'],
+            'Description': ['First task description', 'Second task description'],
+            'Command Template': ['ls -la', 'grep "error" log.txt'],
+            'Expected Output': ['.*file1.txt.*', '.*critical error.*'],
+            'Marks': [10, 15]
+        }
+        df = pd.DataFrame(data)
+        response = HttpResponse(content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        response['Content-Disposition'] = 'attachment; filename="practical_task_format.xlsx"'
+        df.to_excel(response, index=False)
+        return response
+
+    @action(detail=False, methods=['POST'])
+    def bulk_upload(self, request):
+        file = request.FILES.get('file')
+        exam_id = request.data.get('exam_id')
+        
+        if not file:
+            return Response(
+                {'error': 'No file uploaded'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            if file.name.endswith('.xlsx'):
+                df = pd.read_excel(file)
+            elif file.name.endswith('.xls'):
+                df = pd.read_excel(file, engine='xlrd')
+            elif file.name.endswith('.csv'):
+                df = pd.read_csv(file)
+            else:
+                return Response(
+                    {'error': 'Unsupported file format. Use .xlsx, .xls or .csv'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        except Exception as e:
+            return Response(
+                {'error': f'File processing error: {str(e)}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        required_columns = ['Title', 'Description', 'Command Template', 'Expected Output', 'Marks']
+        missing_cols = [col for col in required_columns if col not in df.columns]
+        if missing_cols:
+            return Response(
+                {'error': f'Missing columns: {", ".join(missing_cols)}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        exam = None
+        if exam_id:
+            try:
+                exam = Exam.objects.get(id=exam_id, mode='practical')
+            except Exam.DoesNotExist:
+                return Response(
+                    {'error': 'Exam not found or not in practical mode'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
+        created_tasks = []
+        errors = []
+        
+        with transaction.atomic():
+            for index, row in df.iterrows():
+                try:
+                    task_data = {
+                        'title': str(row['Title']).strip(),
+                        'description': str(row['Description']).strip(),
+                        'command_template': str(row['Command Template']).strip(),
+                        'expected_output': str(row['Expected Output']).strip(),
+                        'marks': int(row['Marks'])
+                    }
+                    
+                    if not task_data['title']:
+                        raise ValidationError('Title is required')
+                        
+                    if not task_data['expected_output']:
+                        raise ValidationError('Expected output is required')
+                    
+                    # Validate regex pattern
+                    try:
+                        re.compile(task_data['expected_output'])
+                    except re.error as e:
+                        raise ValidationError(f'Invalid regex pattern: {str(e)}')
+                    
+                    # Create or update task
+                    task, created = PracticalTask.objects.update_or_create(
+                        title=task_data['title'],
+                        defaults=task_data
+                    )
+                    created_tasks.append(task)
+                    
+                    # Link to exam if provided
+                    if exam:
+                        if not ExamPracticalTask.objects.filter(exam=exam, task=task).exists():
+                            max_order = ExamPracticalTask.objects.filter(exam=exam).aggregate(
+                                max_order=models.Max('order')
+                            )['max_order'] or 0
+                            
+                            ExamPracticalTask.objects.create(
+                                exam=exam,
+                                task=task,
+                                order=max_order + 1
+                            )
+                except Exception as e:
+                    errors.append(f"Row {index+2}: {str(e)}")
+        
+        if errors:
+            return Response(
+                {'error': f'{len(errors)} errors occurred', 'details': errors},
+                status=status.HTTP_207_MULTI_STATUS
+            )
+        
+        return Response(
+            {'success': f'Processed {len(created_tasks)} tasks (created/updated)'},
+            status=status.HTTP_201_CREATED
+        )

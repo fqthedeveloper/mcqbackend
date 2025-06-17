@@ -32,3 +32,10 @@ class AnswerAdmin(admin.ModelAdmin):
 @admin.register(Result)
 class ResultAdmin(admin.ModelAdmin):
     list_display = ['session', 'score', 'total_marks']
+
+
+@admin.register(PracticalTask)
+class PracticalTaskAdmin(admin.ModelAdmin):
+    list_display = ['title', 'marks', 'created_at']
+    search_fields = ['title', 'description']
+    list_filter = ['created_at']

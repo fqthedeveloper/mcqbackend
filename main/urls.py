@@ -1,11 +1,12 @@
-from django.urls import path, include
+from django.urls import path, include, re_path
 from rest_framework import routers
 from .views import (
     UserViewSet, SubjectViewSet, QuestionViewSet,
     ExamViewSet, ExamSessionViewSet, AnswerViewSet,
     ResultViewSet, StudentViewSet, SendOTPView,
-    LoginView, ForcePasswordChangeView, VerifyOTPView
+    LoginView, ForcePasswordChangeView, VerifyOTPView, PracticalTaskViewSet
 )
+from . import consumers
 
 router = routers.DefaultRouter()
 router.register(r'users', UserViewSet, basename='user')
@@ -16,6 +17,7 @@ router.register(r'sessions', ExamSessionViewSet, basename='session')
 router.register(r'answers', AnswerViewSet, basename='answer')
 router.register(r'results', ResultViewSet, basename='result')
 router.register(r'students', StudentViewSet, basename='student')
+router.register(r'tasks', PracticalTaskViewSet, basename='task')
 
 urlpatterns = [
     path('', include(router.urls)),
@@ -27,4 +29,8 @@ urlpatterns = [
     path('sessions/<int:pk>/submit/', ExamSessionViewSet.as_view({'post': 'submit_exam'}), name='session-submit'),
     path('send-otp/', SendOTPView.as_view(), name='send_otp'),
     path('verify-otp/', VerifyOTPView.as_view(), name='verify_otp'),
+]
+
+websocket_urlpatterns = [
+    re_path(r'ws/practical/(?P<session_id>[^/]+)/$', consumers.PracticalTerminalConsumer.as_asgi()),
 ]

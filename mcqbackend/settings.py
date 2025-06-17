@@ -41,6 +41,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'rest_framework.authtoken',
     'corsheaders',
+    'channels',
 ]
 
 MIDDLEWARE = [
@@ -71,7 +72,9 @@ TEMPLATES = [
     },
 ]
 
-WSGI_APPLICATION = 'mcqbackend.wsgi.application'
+#WSGI_APPLICATION = 'mcqbackend.wsgi.application'
+ASGI_APPLICATION = 'mcqbackend.asgi.application'
+
 
 
 # Database
