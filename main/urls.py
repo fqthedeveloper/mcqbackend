@@ -4,7 +4,8 @@ from .views import (
     UserViewSet, SubjectViewSet, QuestionViewSet,
     ExamViewSet, ExamSessionViewSet, AnswerViewSet,
     ResultViewSet, StudentViewSet, SendOTPView,
-    LoginView, ForcePasswordChangeView, VerifyOTPView, PracticalTaskViewSet
+    LoginView, ForcePasswordChangeView, VerifyOTPView, PracticalTaskViewSet,
+    DockerEnvironmentViewSet
 )
 from . import consumers
 
@@ -18,6 +19,7 @@ router.register(r'answers', AnswerViewSet, basename='answer')
 router.register(r'results', ResultViewSet, basename='result')
 router.register(r'students', StudentViewSet, basename='student')
 router.register(r'tasks', PracticalTaskViewSet, basename='task')
+router.register(r'environments', DockerEnvironmentViewSet, basename='environment')
 
 urlpatterns = [
     path('', include(router.urls)),
@@ -32,5 +34,5 @@ urlpatterns = [
 ]
 
 websocket_urlpatterns = [
-    re_path(r'ws/practical/(?P<session_id>[^/]+)/$', consumers.PracticalTerminalConsumer.as_asgi()),
+    re_path(r'ws/practical/(?P<session_id>[0-9a-f-]+)/$', consumers.PracticalTerminalConsumer.as_asgi()),
 ]

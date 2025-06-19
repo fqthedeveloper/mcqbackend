@@ -1,9 +1,5 @@
-import csv
-import io
-import json
-from tkinter.font import Font
+import docker
 from django.shortcuts import get_object_or_404
-from openpyxl import Workbook
 from rest_framework import viewsets, status
 from rest_framework.response import Response
 from rest_framework.decorators import action
@@ -25,12 +21,11 @@ from rest_framework.authentication import TokenAuthentication
 from rest_framework.exceptions import PermissionDenied, ValidationError as DRFValidationError
 from django.conf import settings
 import random
-import re
-from channels.generic.websocket import AsyncWebsocketConsumer
-import subprocess
-from asgiref.sync import sync_to_async
 
-User = get_user_model()
+from django.db.models import Prefetch
+
+
+
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -267,10 +262,22 @@ class ExamViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
+        queryset = Exam.objects.prefetch_related(
+            Prefetch(
+                'practical_tasks',
+                queryset=ExamPracticalTask.objects.select_related('task').order_by('order')
+            ),
+            Prefetch(
+                'examquestion_set',
+                queryset=ExamQuestion.objects.select_related('question').order_by('order')
+            ),
+            'environments'
+        )
+        
         user = self.request.user
         if user.user_type == 'student':
-            return Exam.objects.filter(is_published=True)
-        return Exam.objects.all()
+            queryset = queryset.filter(is_published=True)
+        return queryset
 
     @action(detail=True, methods=['POST'])
     def publish(self, request, pk=None):
@@ -298,6 +305,18 @@ class ExamViewSet(viewsets.ModelViewSet):
         return Response({'status': 'unpublished'})
     
 
+class DockerEnvironmentViewSet(viewsets.ModelViewSet):
+    queryset = DockerEnvironment.objects.all()
+    serializer_class = DockerEnvironmentSerializer
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+class PracticalTaskViewSet(viewsets.ModelViewSet):
+    queryset = PracticalTask.objects.all()
+    serializer_class = PracticalTaskSerializer
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
 class ExamSessionViewSet(viewsets.ModelViewSet):
     serializer_class = ExamSessionSerializer
     permission_classes = [IsAuthenticated]
@@ -309,9 +328,7 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
             return ExamSession.objects.all()
         elif user.user_type == 'student':
             return ExamSession.objects.filter(student=user)
-        elif user.user_type == 'teacher':
-            return ExamSession.objects.filter(exam__subject__teacher=user)
-        return ExamSession.objects.none()
+        return ExamSession.objects.filter(exam__subject__teacher=user)
 
     def get_object(self):
         try:
@@ -331,7 +348,8 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
             try:
                 exam = Exam.objects.get(id=exam_id)
                 if exam.mode == 'practical':
-                    return self.create_practical_session(user, exam, session_id)
+                    session = ExamSession.objects.create(student=user, exam=exam)
+                    return session
                 else:
                     logger.warning("Invalid exam mode for session creation")
                     raise DRFValidationError(
@@ -344,39 +362,6 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
                     {'error': 'Exam not found'},
                     code=status.HTTP_404_NOT_FOUND
                 )
-
-    def create_practical_session(self, user, exam, session_id=None):
-        if exam.mode == 'strict':
-            if ExamSession.objects.filter(student=user, exam=exam, is_completed=True).exists():
-                raise DRFValidationError(
-                    {'error': 'Strict exam already completed'},
-                    code=status.HTTP_400_BAD_REQUEST
-                )
-
-        try:
-            existing_session = ExamSession.objects.get(id=session_id)
-            if existing_session.student != user:
-                raise PermissionDenied("Session already exists for another user")
-            return existing_session
-        except ExamSession.DoesNotExist:
-            pass
-
-        session = ExamSession(
-            id=session_id,
-            student=user,
-            exam=exam,
-            is_completed=False
-        )
-
-        try:
-            session.full_clean()
-            session.save()
-            return session
-        except Exception as e:
-            raise DRFValidationError(
-                {'error': str(e)},
-                code=status.HTTP_400_BAD_REQUEST
-            )
 
     @action(detail=False, methods=['post'], url_path='validate-exam')
     def validate_exam_session(self, request):
@@ -397,7 +382,6 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        # Check for existing active session
         existing_session = ExamSession.objects.filter(
             student=student, 
             exam=exam, 
@@ -408,7 +392,6 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
             serializer = self.get_serializer(existing_session)
             return Response(serializer.data)
 
-        # Create new session
         session = ExamSession(student=student, exam=exam, is_completed=False)
         try:
             session.full_clean()
@@ -433,7 +416,6 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
         except Exam.DoesNotExist:
             return Response({'error': 'Exam not found'}, status=status.HTTP_404_NOT_FOUND)
 
-        # Check for existing active session
         existing_session = ExamSession.objects.filter(
             student=student, 
             exam=exam, 
@@ -444,7 +426,6 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
             serializer = self.get_serializer(existing_session)
             return Response(serializer.data, status=status.HTTP_200_OK)
 
-        # Create new session
         session = ExamSession(student=student, exam=exam, is_completed=False)
         try:
             session.full_clean()
@@ -495,7 +476,6 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
             )
 
         with transaction.atomic():
-            # Delete existing answers only if new ones are provided
             if answers_data:
                 Answer.objects.filter(session=session).delete()
 
@@ -515,24 +495,6 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
             
         return Response({'status': 'progress saved'}, status=status.HTTP_200_OK)
 
-    @action(detail=True, methods=['POST'], url_path='save_terminal')
-    def save_terminal(self, request, pk=None):
-        session = self.get_object()
-        if session.student != request.user:
-            raise PermissionDenied("Invalid session owner")
-        
-        if session.is_completed:
-            return Response(
-                {'error': 'Exam already submitted'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        terminal_output = request.data.get('terminal_output', '')
-        session.terminal_output = terminal_output
-        session.save()
-        
-        return Response({'status': 'terminal output saved'})
-
     @action(detail=True, methods=['POST'])
     def submit_exam(self, request, pk=None):
         session = self.get_object()
@@ -551,54 +513,6 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
         else:
             return self._submit_mcq_exam(session, request)
 
-    def _submit_practical_exam(self, session, request):
-        terminal_output = request.data.get('terminal_output', '')
-        session.terminal_output = terminal_output
-        
-        answers = PracticalAnswer.objects.filter(session=session).select_related('task')
-        total_marks = 0
-        score = 0
-        details = {}
-        
-        with transaction.atomic():
-            for answer in answers:
-                task = answer.task
-                total_marks += task.marks
-                
-                try:
-                    pattern = re.compile(task.expected_output)
-                    is_verified = bool(pattern.search(answer.output))
-                except re.error:
-                    is_verified = False
-                    
-                earned = task.marks if is_verified else 0
-                score += earned
-                
-                answer.is_verified = is_verified
-                answer.save()
-                
-                details[task.id] = {
-                    'command_used': answer.command_used,
-                    'output': answer.output,
-                    'expected_output': task.expected_output,
-                    'is_verified': is_verified,
-                    'marks': task.marks,
-                    'earned': earned
-                }
-            
-            result = Result.objects.create(
-                session=session,
-                score=score,
-                total_marks=total_marks,
-                details=details
-            )
-            
-            session.end_time = timezone.now()
-            session.is_completed = True
-            session.save()
-        
-        return Response(ResultSerializer(result).data, status=status.HTTP_200_OK)
-
     def _submit_mcq_exam(self, session, request):
         answers_data = request.data.get('answers', [])
         elapsed_time = request.data.get('elapsed_time', 0)
@@ -611,7 +525,6 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
             )
 
         with transaction.atomic():
-            # Delete existing answers only if new ones are provided
             if answers_data:
                 Answer.objects.filter(session=session).delete()
 
@@ -664,84 +577,258 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
 
         return Response(ResultSerializer(result).data, status=status.HTTP_200_OK)
 
-    @action(detail=True, methods=['GET'], url_path='download_answers')
-    def download_answers(self, request, pk=None):
-        session = self.get_object()
+    def _submit_practical_exam(self, session, request):
+        if session.is_completed:
+            return Response({'error': 'Exam already submitted'}, status=status.HTTP_400_BAD_REQUEST)
         
-        if session.student != request.user and request.user.user_type != 'teacher':
-            return Response(
-                {'error': 'Permission denied'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        
-        if session.exam.mode == 'practical':
-            answers = PracticalAnswer.objects.filter(session=session).select_related('task')
-        else:
-            answers = Answer.objects.filter(session=session).select_related('question')
-        
-        response = HttpResponse(
-            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        )
-        filename = f"{session.exam.title}_{session.student.username}_answers.xlsx"
-        response['Content-Disposition'] = f'attachment; filename="{filename}"'
-        
-        workbook = Workbook()
-        worksheet = workbook.active
-        worksheet.title = "Exam Answers"
-        
-        if session.exam.mode == 'practical':
-            headers = [
-                'Task Title', 'Description', 'Command Used', 
-                'Output', 'Expected Output', 'Marks', 'Status'
-            ]
-            for col_num, header in enumerate(headers, 1):
-                cell = worksheet.cell(row=1, column=col_num, value=header)
-                cell.font = Font(bold=True)
-            
-            for row_num, answer in enumerate(answers, 2):
-                worksheet.cell(row=row_num, column=1, value=answer.task.title)
-                worksheet.cell(row=row_num, column=2, value=answer.task.description)
-                worksheet.cell(row=row_num, column=3, value=answer.command_used)
-                worksheet.cell(row=row_num, column=4, value=answer.output)
-                worksheet.cell(row=row_num, column=5, value=answer.task.expected_output)
-                worksheet.cell(row=row_num, column=6, value=answer.task.marks)
-                worksheet.cell(row=row_num, column=7, value='Verified' if answer.is_verified else 'Pending')
-        else:
-            headers = [
-                'Question', 'Selected Answers', 'Correct Answers', 
-                'Status', 'Marks', 'Earned'
-            ]
-            for col_num, header in enumerate(headers, 1):
-                cell = worksheet.cell(row=1, column=col_num, value=header)
-                cell.font = Font(bold=True)
-            
-            for row_num, answer in enumerate(answers, 2):
-                question = answer.question
-                correct_set = set(question.correct_option.split(','))
-                selected_set = set(answer.selected_answers.split(','))
-                is_correct = correct_set == selected_set
-                
-                worksheet.cell(row=row_num, column=1, value=question.text)
-                worksheet.cell(row=row_num, column=2, value=answer.selected_answers)
-                worksheet.cell(row=row_num, column=3, value=question.correct_option)
-                worksheet.cell(row=row_num, column=4, value='Correct' if is_correct else 'Incorrect')
-                worksheet.cell(row=row_num, column=5, value=question.marks)
-                worksheet.cell(row=row_num, column=6, value=question.marks if is_correct else 0)
-        
-        for col in worksheet.columns:
-            max_length = 0
-            column = col[0].column_letter
-            for cell in col:
+        if session.container_id:
+            try:
+                client = docker.from_env()
+                container = client.containers.get(session.container_id)
+                container.stop()
+                container.remove()
                 try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(cell.value)
+                    client.volumes.get(f'exam-home-{session.id}').remove()
                 except:
                     pass
-            adjusted_width = (max_length + 2)
-            worksheet.column_dimensions[column].width = adjusted_width
+            except:
+                pass
         
-        workbook.save(response)
-        return response
+        answers = PracticalAnswer.objects.filter(session=session).select_related('task')
+        total_marks = 0
+        score = 0
+        details = {}
+        
+        for answer in answers:
+            task = answer.task
+            total_marks += task.marks
+            earned = task.marks if answer.is_verified else 0
+            score += earned
+            
+            details[str(task.id)] = {
+                'task_title': task.title,
+                'command_used': answer.command_used,
+                'is_verified': answer.is_verified,
+                'verification_output': answer.verification_output,
+                'marks': task.marks,
+                'earned': earned
+            }
+        
+        result = Result.objects.create(
+            session=session,
+            score=score,
+            total_marks=total_marks,
+            details=details
+        )
+        
+        session.end_time = timezone.now()
+        session.is_completed = True
+        session.save()
+        
+        return Response(ResultSerializer(result).data)
+
+    @action(detail=True, methods=['post'], url_path='start-container')
+    def start_container(self, request, pk=None):
+        session = self.get_object()
+        
+        if session.container_id:
+            return Response({'status': 'container already running', 'container_id': session.container_id})
+        
+        try:
+            # Ensure exam has environments
+            if not session.exam.environments.exists():
+                return Response(
+                    {'error': 'No Docker environment configured for this exam'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            environment = session.exam.environments.first()
+            client = docker.from_env()
+            
+            # Create container with proper environment setup
+            container = client.containers.run(
+                environment.image,
+                command="/bin/sleep infinity",  # Keep container alive
+                detach=True,
+                tty=True,
+                stdin_open=True,
+                name=f"exam-session-{session.id}",
+                network_mode='none',
+                mem_limit='1g',
+                cpu_period=50000,
+                cpu_quota=25000,
+                volumes={'exam-home-{session.id}': {'bind': '/home/user', 'mode': 'rw'}},
+                user='user'
+            )
+            
+            # Execute setup script
+            exit_code, output = container.exec_run(
+                f"/bin/bash -c '{environment.setup_script}'",
+                user='root',
+                workdir='/'
+            )
+            
+            if exit_code != 0:
+                logger.error(f"Setup script failed: {output.decode('utf-8')}")
+                container.stop()
+                container.remove()
+                return Response(
+                    {'error': 'Failed to initialize environment'},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+            
+            # Update session with container ID
+            session.container_id = container.id
+            session.save()
+            
+            return Response({
+                'status': 'container started',
+                'container_id': container.id,
+                'image': environment.image
+            })
+        except docker.errors.ImageNotFound:
+            return Response(
+                {'error': f'Docker image not found: {environment.image}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except docker.errors.DockerException as e:
+            logger.error(f"Docker error: {str(e)}")
+            return Response({'error': f'Docker error: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=True, methods=['post'], url_path='stop-container')
+    def stop_container(self, request, pk=None):
+        session = self.get_object()
+        
+        if not session.container_id:
+            return Response({'status': 'no container running'})
+        
+        try:
+            client = docker.from_env()
+            container = client.containers.get(session.container_id)
+            container.stop()
+            container.remove()
+            
+            try:
+                client.volumes.get(f'exam-home-{session.id}').remove()
+            except:
+                pass
+            
+            session.container_id = ''
+            session.save()
+            
+            return Response({'status': 'container stopped and removed'})
+        except docker.errors.NotFound:
+            session.container_id = ''
+            session.save()
+            return Response({'status': 'container not found, cleaned session'})
+        except docker.errors.DockerException as e:
+            logger.error(f"Docker error: {str(e)}")
+            return Response({'error': f'Docker error: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=True, methods=['post'], url_path='execute-command')
+    def execute_command(self, request, pk=None):
+        session = self.get_object()
+        command = request.data.get('command')
+        task_id = request.data.get('task_id')
+        
+        if not command:
+            return Response({'error': 'Command required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        if not session.container_id:
+            return Response({'error': 'Container not running'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            client = docker.from_env()
+            container = client.containers.get(session.container_id)
+            
+            # Execute command in container
+            exit_code, output = container.exec_run(
+                f"/bin/bash -c {shlex.quote(command)}",
+                user='user',
+                workdir='/home/user',
+                environment={'TERM': 'xterm-256color'},
+                demux=True
+            )
+            
+            stdout, stderr = output
+            stdout = stdout.decode('utf-8') if stdout else ''
+            stderr = stderr.decode('utf-8') if stderr else ''
+            
+            # Save command history
+            if task_id:
+                task = PracticalTask.objects.get(id=task_id)
+                PracticalAnswer.objects.update_or_create(
+                    session=session,
+                    task=task,
+                    defaults={'command_used': command, 'output': stdout + stderr}
+                )
+            
+            return Response({
+                'exit_code': exit_code,
+                'stdout': stdout,
+                'stderr': stderr
+            })
+        except docker.errors.NotFound:
+            return Response({'error': 'Container not found'}, status=status.HTTP_404_NOT_FOUND)
+        except PracticalTask.DoesNotExist:
+            return Response({'error': 'Invalid task ID'}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'], url_path='verify-task')
+    def verify_task(self, request, pk=None):
+        session = self.get_object()
+        task_id = request.data.get('task_id')
+        
+        if not session.container_id:
+            return Response({'error': 'Container not running'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            task = PracticalTask.objects.get(id=task_id)
+            client = docker.from_env()
+            container = client.containers.get(session.container_id)
+            
+            # Run verification script
+            exit_code, output = container.exec_run(
+                f"/bin/bash -c '{task.verification_script}'",
+                user='root',
+                demux=True
+            )
+            
+            stdout, stderr = output
+            combined_output = (stdout.decode('utf-8') if stdout else '') + (stderr.decode('utf-8') if stderr else '')
+            
+            # Save verification result
+            PracticalAnswer.objects.update_or_create(
+                session=session,
+                task=task,
+                defaults={
+                    'is_verified': exit_code == 0,
+                    'verification_output': combined_output
+                }
+            )
+            
+            return Response({
+                'verified': exit_code == 0,
+                'output': combined_output
+            })
+        except PracticalTask.DoesNotExist:
+            return Response({'error': 'Invalid task ID'}, status=status.HTTP_400_BAD_REQUEST)
+
+class PracticalAnswerViewSet(viewsets.ModelViewSet):
+    queryset = PracticalAnswer.objects.all()
+    serializer_class = PracticalAnswerSerializer
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+class ResultViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = ResultSerializer
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
+    
+    def get_queryset(self):
+        user = self.request.user
+        if user.user_type == 'student':
+            return Result.objects.filter(session__student=user)
+        return Result.objects.filter(session__exam__subject__teacher=user)
     
     
 class AnswerViewSet(viewsets.ModelViewSet):
@@ -922,132 +1009,3 @@ class GetStudentEmailView(APIView):
             return Response({'email': student.email})
         except User.DoesNotExist:
             return Response({'error': 'Student not found'}, status=404)
-
-
-
-class PracticalTaskViewSet(viewsets.ModelViewSet):
-    queryset = PracticalTask.objects.all()
-    serializer_class = PracticalTaskSerializer
-    authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]
-    
-    @action(detail=False, methods=['GET'])
-    def download_format(self, request):
-        data = {
-            'Title': ['Task 1', 'Task 2'],
-            'Description': ['First task description', 'Second task description'],
-            'Command Template': ['ls -la', 'grep "error" log.txt'],
-            'Expected Output': ['.*file1.txt.*', '.*critical error.*'],
-            'Marks': [10, 15]
-        }
-        df = pd.DataFrame(data)
-        response = HttpResponse(content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-        response['Content-Disposition'] = 'attachment; filename="practical_task_format.xlsx"'
-        df.to_excel(response, index=False)
-        return response
-
-    @action(detail=False, methods=['POST'])
-    def bulk_upload(self, request):
-        file = request.FILES.get('file')
-        exam_id = request.data.get('exam_id')
-        
-        if not file:
-            return Response(
-                {'error': 'No file uploaded'}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        try:
-            if file.name.endswith('.xlsx'):
-                df = pd.read_excel(file)
-            elif file.name.endswith('.xls'):
-                df = pd.read_excel(file, engine='xlrd')
-            elif file.name.endswith('.csv'):
-                df = pd.read_csv(file)
-            else:
-                return Response(
-                    {'error': 'Unsupported file format. Use .xlsx, .xls or .csv'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-        except Exception as e:
-            return Response(
-                {'error': f'File processing error: {str(e)}'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        required_columns = ['Title', 'Description', 'Command Template', 'Expected Output', 'Marks']
-        missing_cols = [col for col in required_columns if col not in df.columns]
-        if missing_cols:
-            return Response(
-                {'error': f'Missing columns: {", ".join(missing_cols)}'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        exam = None
-        if exam_id:
-            try:
-                exam = Exam.objects.get(id=exam_id, mode='practical')
-            except Exam.DoesNotExist:
-                return Response(
-                    {'error': 'Exam not found or not in practical mode'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-        
-        created_tasks = []
-        errors = []
-        
-        with transaction.atomic():
-            for index, row in df.iterrows():
-                try:
-                    task_data = {
-                        'title': str(row['Title']).strip(),
-                        'description': str(row['Description']).strip(),
-                        'command_template': str(row['Command Template']).strip(),
-                        'expected_output': str(row['Expected Output']).strip(),
-                        'marks': int(row['Marks'])
-                    }
-                    
-                    if not task_data['title']:
-                        raise ValidationError('Title is required')
-                        
-                    if not task_data['expected_output']:
-                        raise ValidationError('Expected output is required')
-                    
-                    # Validate regex pattern
-                    try:
-                        re.compile(task_data['expected_output'])
-                    except re.error as e:
-                        raise ValidationError(f'Invalid regex pattern: {str(e)}')
-                    
-                    # Create or update task
-                    task, created = PracticalTask.objects.update_or_create(
-                        title=task_data['title'],
-                        defaults=task_data
-                    )
-                    created_tasks.append(task)
-                    
-                    # Link to exam if provided
-                    if exam:
-                        if not ExamPracticalTask.objects.filter(exam=exam, task=task).exists():
-                            max_order = ExamPracticalTask.objects.filter(exam=exam).aggregate(
-                                max_order=models.Max('order')
-                            )['max_order'] or 0
-                            
-                            ExamPracticalTask.objects.create(
-                                exam=exam,
-                                task=task,
-                                order=max_order + 1
-                            )
-                except Exception as e:
-                    errors.append(f"Row {index+2}: {str(e)}")
-        
-        if errors:
-            return Response(
-                {'error': f'{len(errors)} errors occurred', 'details': errors},
-                status=status.HTTP_207_MULTI_STATUS
-            )
-        
-        return Response(
-            {'success': f'Processed {len(created_tasks)} tasks (created/updated)'},
-            status=status.HTTP_201_CREATED
-        )

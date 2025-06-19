@@ -216,27 +216,50 @@ class ExamQuestionSerializer(serializers.ModelSerializer):
         model = ExamQuestion
         fields = ['id', 'question', 'order']
 
+class DockerEnvironmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DockerEnvironment
+        fields = '__all__'
+
 class PracticalTaskSerializer(serializers.ModelSerializer):
+    environment = DockerEnvironmentSerializer(read_only=True)
+    environment_id = serializers.PrimaryKeyRelatedField(
+        queryset=DockerEnvironment.objects.all(),
+        source='environment',
+        write_only=True,
+        required=True
+    )
+    
     class Meta:
         model = PracticalTask
         fields = '__all__'
 
-class ExamPracticalTaskSerializer(serializers.ModelSerializer):
+class ExamTaskSerializer(serializers.ModelSerializer):
     task = PracticalTaskSerializer()
     
     class Meta:
         model = ExamPracticalTask
         fields = ['id', 'task', 'order']
 
+class ExamPracticalTaskSerializer(serializers.ModelSerializer):
+    id = serializers.ReadOnlyField(source='task.id')
+    title = serializers.ReadOnlyField(source='task.title')
+    description = serializers.ReadOnlyField(source='task.description')
+    marks = serializers.ReadOnlyField(source='task.marks')
+
+    class Meta:
+        model = ExamPracticalTask
+        fields = ['id', 'title', 'description', 'marks', 'order']
 
 class ExamSerializer(serializers.ModelSerializer):
     questions = serializers.SerializerMethodField()
-    practical_tasks = serializers.SerializerMethodField()
+    environments = DockerEnvironmentSerializer(many=True, read_only=True)
     subject_name = serializers.CharField(source='subject.name', read_only=True)
     created_at = serializers.DateTimeField(format='%Y-%m-%d %H:%M:%S', read_only=True)
     updated_at = serializers.DateTimeField(format='%Y-%m-%d %H:%M:%S', read_only=True)
     question_count = serializers.SerializerMethodField()
     task_count = serializers.SerializerMethodField()
+    practical_tasks = serializers.SerializerMethodField()
     selected_questions = serializers.ListField(
         child=serializers.IntegerField(),
         write_only=True,
@@ -256,67 +279,84 @@ class ExamSerializer(serializers.ModelSerializer):
             'id', 'title', 'subject', 'subject_name', 'mode', 'duration', 
             'start_time', 'end_time', 'is_published', 'created_at', 'updated_at',
             'questions', 'practical_tasks', 'question_count', 'task_count',
-            'selected_questions', 'selected_tasks'
+            'selected_questions', 'selected_tasks', 'environments'
         ]
 
     def get_questions(self, obj):
         return ExamQuestionSerializer(obj.examquestion_set.all(), many=True).data
         
     def get_practical_tasks(self, obj):
-        return ExamPracticalTaskSerializer(obj.exampracticaltask_set.all(), many=True).data
+        exam_practical_tasks = obj.practical_tasks.all().order_by('order')
+        tasks = [ept.task for ept in exam_practical_tasks]
+        return PracticalTaskSerializer(tasks, many=True).data
 
     def get_question_count(self, obj):
         return obj.examquestion_set.count()
         
     def get_task_count(self, obj):
-        return obj.exampracticaltask_set.count()
+        return obj.practical_tasks.count()
 
     def create(self, validated_data):
         selected_questions = validated_data.pop('selected_questions', [])
         selected_tasks = validated_data.pop('selected_tasks', [])
+        environments = validated_data.pop('environments', [])
+        
         exam = Exam.objects.create(**validated_data)
         
+        # Link questions
         for order, question_id in enumerate(selected_questions):
-            try:
-                question = Question.objects.get(id=question_id)
-                ExamQuestion.objects.create(exam=exam, question=question, order=order)
-            except Question.DoesNotExist:
-                continue
+            ExamQuestion.objects.create(
+                exam=exam, 
+                question_id=question_id, 
+                order=order
+            )
         
+        # Link tasks
         for order, task_id in enumerate(selected_tasks):
-            try:
-                task = PracticalTask.objects.get(id=task_id)
-                ExamPracticalTask.objects.create(exam=exam, task=task, order=order)
-            except PracticalTask.DoesNotExist:
-                continue
+            ExamPracticalTask.objects.create(
+                exam=exam, 
+                task_id=task_id, 
+                order=order
+            )
+        
+        # Link environments
+        exam.environments.set(environments)
                 
         return exam
 
     def update(self, instance, validated_data):
         selected_questions = validated_data.pop('selected_questions', None)
         selected_tasks = validated_data.pop('selected_tasks', None)
+        environments = validated_data.pop('environments', None)
         
+        # Update exam fields
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save()
 
+        # Update questions
         if selected_questions is not None:
             instance.examquestion_set.all().delete()
             for order, question_id in enumerate(selected_questions):
-                try:
-                    question = Question.objects.get(id=question_id)
-                    ExamQuestion.objects.create(exam=instance, question=question, order=order)
-                except Question.DoesNotExist:
-                    continue
+                ExamQuestion.objects.create(
+                    exam=instance, 
+                    question_id=question_id, 
+                    order=order
+                )
                     
+        # Update tasks
         if selected_tasks is not None:
-            instance.exampracticaltask_set.all().delete()
+            instance.practical_tasks.all().delete()
             for order, task_id in enumerate(selected_tasks):
-                try:
-                    task = PracticalTask.objects.get(id=task_id)
-                    ExamPracticalTask.objects.create(exam=instance, task=task, order=order)
-                except PracticalTask.DoesNotExist:
-                    continue
+                ExamPracticalTask.objects.create(
+                    exam=instance, 
+                    task_id=task_id, 
+                    order=order
+                )
+        
+        # Update environments
+        if environments is not None:
+            instance.environments.set(environments)
                     
         return instance
 
@@ -324,6 +364,7 @@ class PracticalAnswerSerializer(serializers.ModelSerializer):
     class Meta:
         model = PracticalAnswer
         fields = '__all__'
+
 
 class ExamSessionSerializer(serializers.ModelSerializer):
     exam_title = serializers.CharField(source='exam.title', read_only=True)
@@ -337,15 +378,22 @@ class ExamSessionSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'exam', 'exam_title', 'exam_mode', 'exam_duration', 'student',
             'student_name', 'start_time', 'end_time', 'is_completed', 'elapsed_time',
-            'terminal_output', 'termination_reason', 'practical_tasks'
+            'termination_reason', 'practical_tasks', 'container_id'
         ]
-        read_only_fields = ['start_time', 'end_time', 'is_completed']
+        read_only_fields = ['start_time', 'end_time', 'is_completed', 'container_id']
     
     def get_practical_tasks(self, obj):
-        if obj.exam.mode == 'practical':
-            tasks = obj.exam.exampracticaltask_set.all().order_by('order')
-            return ExamPracticalTaskSerializer(tasks, many=True).data
-        return None
+        # Get through-model objects with proper ordering
+        exam_tasks = ExamPracticalTask.objects.filter(
+            exam=obj.exam
+        ).order_by('order').select_related('task')
+        
+        return ExamPracticalTaskSerializer(
+            exam_tasks,
+            many=True,
+            context=self.context
+        ).data
+    
 
 class AnswerSerializer(serializers.ModelSerializer):
     class Meta:

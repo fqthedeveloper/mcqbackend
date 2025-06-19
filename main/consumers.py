@@ -1,13 +1,12 @@
+# consumers.py
 import json
-import subprocess
-import re
 import logging
+import docker
 from channels.generic.websocket import AsyncWebsocketConsumer
-from django.contrib.auth.models import AnonymousUser
 from asgiref.sync import sync_to_async
+from django.contrib.auth.models import AnonymousUser
 from rest_framework.authtoken.models import Token
-from django.core.exceptions import ObjectDoesNotExist
-from .models import ExamSession, Exam, PracticalTask, PracticalAnswer
+from .models import ExamSession, PracticalTask, PracticalAnswer
 
 logger = logging.getLogger(__name__)
 
@@ -16,64 +15,42 @@ class PracticalTerminalConsumer(AsyncWebsocketConsumer):
         self.session_id = self.scope['url_route']['kwargs']['session_id']
         self.user = AnonymousUser()
         
-        query_params = self.scope.get('query_string', b'').decode().split('&')
+        # Authenticate via token
         token_key = None
-        exam_id = None
+        for item in self.scope['query_string'].decode().split('&'):
+            if item.startswith('token='):
+                token_key = item.split('=')[1]
+                break
         
-        for param in query_params:
-            if '=' in param:
-                key, value = param.split('=', 1)
-                if key == 'token':
-                    token_key = value
-                elif key == 'exam_id':
-                    exam_id = value
+        if token_key:
+            try:
+                token = await sync_to_async(Token.objects.get)(key=token_key)
+                self.user = token.user
+            except Token.DoesNotExist:
+                pass
         
-        if not token_key:
-            await self.close(code=4001)
-            return
-            
-        try:
-            token = await sync_to_async(Token.objects.get)(key=token_key)
-            self.user = token.user
-        except Token.DoesNotExist:
-            await self.close(code=4001)
+        if not self.user.is_authenticated or self.user.user_type != 'student':
+            await self.close()
             return
         
-        if self.user.user_type != 'student':
-            await self.close(code=4001)
-            return
-        
-        if not exam_id:
-            await self.close(code=4002)
-            return
-        
+        # Get exam session
         try:
             self.session = await sync_to_async(ExamSession.objects.get)(
-                id=int(self.session_id),
-                student=self.user
+                id=self.session_id,
+                student=self.user,
+                is_completed=False
             )
-            if self.session.is_completed:
-                await self.close(code=4003)
-                return
-                
-        except (ObjectDoesNotExist, ValueError):
+        except ExamSession.DoesNotExist:
+            await self.close()
+            return
+        
+        # Start container if not running
+        if not self.session.container_id:
             try:
-                exam = await sync_to_async(Exam.objects.get)(id=int(exam_id))
-                if exam.mode == 'practical':
-                    try:
-                        self.session = await sync_to_async(ExamSession.objects.get)(id=int(self.session_id))
-                    except ExamSession.DoesNotExist:
-                        self.session = await sync_to_async(ExamSession.objects.create)(
-                            id=int(self.session_id),
-                            student=self.user,
-                            exam=exam,
-                            is_completed=False
-                        )
-                else:
-                    await self.close(code=4002)
-                    return
-            except (Exam.DoesNotExist, ValueError):
-                await self.close(code=4002)
+                await sync_to_async(self.start_container)()
+            except Exception as e:
+                logger.error(f"Failed to start container: {str(e)}")
+                await self.close()
                 return
         
         await self.accept()
@@ -84,6 +61,43 @@ class PracticalTerminalConsumer(AsyncWebsocketConsumer):
 
     async def disconnect(self, close_code):
         pass
+
+    def start_container(self):
+        environment = self.session.exam.environments.first()
+        if not environment:
+            raise Exception("No Docker environment configured")
+        
+        client = docker.from_env()
+        container = client.containers.run(
+            environment.image,
+            command="/bin/bash",
+            detach=True,
+            tty=True,
+            stdin_open=True,
+            name=f"exam-session-{self.session.id}",
+            network_mode='none',
+            mem_limit='1g',
+            cpu_period=50000,
+            cpu_quota=25000,
+            volumes={
+                f'exam-home-{self.session.id}': {'bind': '/home/user', 'mode': 'rw'}
+            },
+            user='user'
+        )
+        
+        # Run setup script
+        exit_code, output = container.exec_run(
+            f"bash -c '{environment.setup_script}'",
+            user='root'
+        )
+        
+        if exit_code != 0:
+            container.stop()
+            container.remove()
+            raise Exception("Setup script failed")
+        
+        self.session.container_id = container.id
+        self.session.save()
 
     async def receive(self, text_data):
         try:
@@ -100,8 +114,12 @@ class PracticalTerminalConsumer(AsyncWebsocketConsumer):
                     }))
                     return
                 
-                blocked_commands = ['rm ', 'shutdown', 'reboot', 'dd ', 'mkfs', 
-                                   ':(){:|:&};:', 'mv ', '> ', 'chmod', 'sudo']
+                # Block dangerous commands
+                blocked_commands = [
+                    'rm ', 'shutdown', 'reboot', 'dd ', 'mkfs', 
+                    ':(){:|:&};:', 'mv ', '> ', 'chmod', 'sudo',
+                    'passwd', 'useradd', 'groupadd', 'visudo'
+                ]
                 if any(cmd in command for cmd in blocked_commands):
                     await self.send(text_data=json.dumps({
                         'type': 'error',
@@ -109,33 +127,18 @@ class PracticalTerminalConsumer(AsyncWebsocketConsumer):
                     }))
                     return
                 
-                try:
-                    process = subprocess.Popen(
-                        command,
-                        shell=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True
-                    )
-                    stdout, stderr = process.communicate(timeout=30)
-                    output = stdout + stderr
-                    
+                # Execute command in container
+                result = await sync_to_async(self.execute_in_container)(command, task_id)
+                
+                if result['status'] == 'success':
                     await self.send(text_data=json.dumps({
                         'type': 'command_output',
-                        'output': output
+                        'output': result['output']
                     }))
-                    
-                    if task_id:
-                        await self.save_answer(command, output, task_id)
-                except subprocess.TimeoutExpired:
+                else:
                     await self.send(text_data=json.dumps({
                         'type': 'error',
-                        'output': '\r\nError: Command timed out after 30 seconds\r\n'
-                    }))
-                except Exception as e:
-                    await self.send(text_data=json.dumps({
-                        'type': 'error',
-                        'output': f"\r\nError: {str(e)}\r\n"
+                        'output': f"\r\nError: {result['error']}\r\n"
                     }))
         except json.JSONDecodeError:
             await self.send(text_data=json.dumps({
@@ -143,25 +146,51 @@ class PracticalTerminalConsumer(AsyncWebsocketConsumer):
                 'output': '\r\nError: Invalid JSON format\r\n'
             }))
 
-    async def save_answer(self, command, output, task_id):
+    def execute_in_container(self, command, task_id=None):
+        if not self.session.container_id:
+            return {'status': 'error', 'error': 'Container not running'}
+        
         try:
-            task = await sync_to_async(PracticalTask.objects.get)(id=task_id)
+            client = docker.from_env()
+            container = client.containers.get(self.session.container_id)
             
-            answer, created = await sync_to_async(PracticalAnswer.objects.update_or_create)(
-                session=self.session,
-                task=task,
-                defaults={
-                    'command_used': command,
-                    'output': output
-                }
+            # Execute command
+            exit_code, output = container.exec_run(
+                f"/bin/bash -c '{command}'",
+                user='user',
+                workdir='/home/user',
+                environment={'TERM': 'xterm-256color'},
+                demux=True
             )
-        except PracticalTask.DoesNotExist:
-            await self.send(text_data=json.dumps({
-                'type': 'error',
-                'output': f"\r\nError: Invalid task ID: {task_id}\r\n"
-            }))
-        except Exception as e:
-            await self.send(text_data=json.dumps({
-                'type': 'error',
-                'output': f"\r\nSave error: {str(e)}\r\n"
-            }))
+            
+            # Decode output
+            stdout, stderr = output
+            stdout = stdout.decode('utf-8') if stdout else ''
+            stderr = stderr.decode('utf-8') if stderr else ''
+            combined_output = stdout + stderr
+            
+            # Save answer if task specified
+            if task_id:
+                try:
+                    task = PracticalTask.objects.get(id=task_id)
+                    PracticalAnswer.objects.update_or_create(
+                        session=self.session,
+                        task=task,
+                        defaults={
+                            'command_used': command,
+                            'output': combined_output
+                        }
+                    )
+                except PracticalTask.DoesNotExist:
+                    pass
+            
+            return {
+                'status': 'success',
+                'output': combined_output,
+                'exit_code': exit_code
+            }
+        except docker.errors.NotFound:
+            return {'status': 'error', 'error': 'Container not found'}
+        except docker.errors.DockerException as e:
+            logger.error(f"Docker error: {str(e)}")
+            return {'status': 'error', 'error': f'Docker error: {str(e)}'}

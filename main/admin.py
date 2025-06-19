@@ -1,3 +1,4 @@
+# admin.py
 from django.contrib import admin
 from .models import *
 
@@ -12,10 +13,14 @@ class SubjectAdmin(admin.ModelAdmin):
 @admin.register(Question)
 class QuestionAdmin(admin.ModelAdmin):
     list_display = ['text', 'subject', 'marks', 'is_multi']
+    search_fields = ['text']
+    list_filter = ['subject']
 
 @admin.register(Exam)
 class ExamAdmin(admin.ModelAdmin):
     list_display = ['title', 'subject', 'mode', 'is_published']
+    # Removed tasks from filter_horizontal since it's a through relationship
+    filter_horizontal = ['environments']  # Only for non-through relationships
 
 @admin.register(ExamQuestion)
 class ExamQuestionAdmin(admin.ModelAdmin):
@@ -28,14 +33,27 @@ class ExamSessionAdmin(admin.ModelAdmin):
 @admin.register(Answer)
 class AnswerAdmin(admin.ModelAdmin):
     list_display = ['session', 'question', 'selected_answers']
+    # Removed created_at since it doesn't exist in the model
 
 @admin.register(Result)
 class ResultAdmin(admin.ModelAdmin):
     list_display = ['session', 'score', 'total_marks']
-
+    # Removed created_at since it doesn't exist in the model
 
 @admin.register(PracticalTask)
 class PracticalTaskAdmin(admin.ModelAdmin):
     list_display = ['title', 'marks', 'created_at']
     search_fields = ['title', 'description']
     list_filter = ['created_at']
+
+@admin.register(PracticalAnswer)
+class PracticalAnswerAdmin(admin.ModelAdmin):
+    list_display = ['session', 'task', 'is_verified', 'created_at']
+
+@admin.register(DockerEnvironment)
+class DockerEnvironmentAdmin(admin.ModelAdmin):
+    list_display = ['name', 'image', 'created_at']
+
+@admin.register(ExamPracticalTask)
+class ExamTaskAdmin(admin.ModelAdmin):
+    list_display = ['exam', 'task', 'order']
