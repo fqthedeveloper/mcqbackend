@@ -1,5 +1,5 @@
-import docker
 from django.shortcuts import get_object_or_404
+import docker
 from rest_framework import viewsets, status
 from rest_framework.response import Response
 from rest_framework.decorators import action
@@ -7,7 +7,7 @@ from .models import *
 from .serializers import *
 from .utils import process_excel
 from django.utils import timezone
-from django.http import Http404, HttpResponse
+from django.http import HttpResponse
 import pandas as pd
 from django.db.models import Q
 from rest_framework.views import APIView
@@ -18,14 +18,12 @@ from django.db import IntegrityError, transaction
 from rest_framework.permissions import IsAuthenticated
 from .permissions import IsAdminUserOnly
 from rest_framework.authentication import TokenAuthentication
-from rest_framework.exceptions import PermissionDenied, ValidationError as DRFValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from django.conf import settings
 import random
 
-from django.db.models import Prefetch
 
-
-
+User = get_user_model()
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -150,7 +148,7 @@ class ForcePasswordChangeView(APIView):
 class SubjectViewSet(viewsets.ModelViewSet):
     queryset = Subject.objects.all()
     serializer_class = SubjectSerializer
-    
+
 
 
 class QuestionViewSet(viewsets.ModelViewSet):
@@ -181,12 +179,12 @@ class QuestionViewSet(viewsets.ModelViewSet):
         # Ensure file exists in request.FILES
         if 'file' not in request.FILES:
             return Response(
-                {'status': 'error', 'message': 'No file uploaded'}, 
+                {'status': 'error', 'message': 'No file uploaded'},
                 status=400
             )
-            
+
         file = request.FILES['file']
-        
+
         try:
             # Handle different Excel formats
             if file.name.endswith('.xlsx'):
@@ -262,22 +260,10 @@ class ExamViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        queryset = Exam.objects.prefetch_related(
-            Prefetch(
-                'practical_tasks',
-                queryset=ExamPracticalTask.objects.select_related('task').order_by('order')
-            ),
-            Prefetch(
-                'examquestion_set',
-                queryset=ExamQuestion.objects.select_related('question').order_by('order')
-            ),
-            'environments'
-        )
-        
         user = self.request.user
         if user.user_type == 'student':
-            queryset = queryset.filter(is_published=True)
-        return queryset
+            return Exam.objects.filter(is_published=True)
+        return Exam.objects.all()
 
     @action(detail=True, methods=['POST'])
     def publish(self, request, pk=None):
@@ -303,19 +289,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         exam.is_published = False
         exam.save()
         return Response({'status': 'unpublished'})
-    
 
-class DockerEnvironmentViewSet(viewsets.ModelViewSet):
-    queryset = DockerEnvironment.objects.all()
-    serializer_class = DockerEnvironmentSerializer
-    authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]
-
-class PracticalTaskViewSet(viewsets.ModelViewSet):
-    queryset = PracticalTask.objects.all()
-    serializer_class = PracticalTaskSerializer
-    authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]
 
 class ExamSessionViewSet(viewsets.ModelViewSet):
     serializer_class = ExamSessionSerializer
@@ -324,133 +298,97 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if user.is_superuser:
-            return ExamSession.objects.all()
-        elif user.user_type == 'student':
-            return ExamSession.objects.filter(student=user)
-        return ExamSession.objects.filter(exam__subject__teacher=user)
-
-    def get_object(self):
-        try:
-            return super().get_object()
-        except Http404:
-            user = self.request.user
-            session_id = self.kwargs['pk']
-            exam_id = self.request.query_params.get('exam_id')
-            
-            if not exam_id:
-                logger.warning("Missing exam_id for session creation")
-                raise DRFValidationError(
-                    {'error': 'exam_id parameter is required'},
-                    code=status.HTTP_400_BAD_REQUEST
-                )
-            
-            try:
-                exam = Exam.objects.get(id=exam_id)
-                if exam.mode == 'practical':
-                    session = ExamSession.objects.create(student=user, exam=exam)
-                    return session
-                else:
-                    logger.warning("Invalid exam mode for session creation")
-                    raise DRFValidationError(
-                        {'error': 'Only practical exams can be created this way'},
-                        code=status.HTTP_400_BAD_REQUEST
-                    )
-            except Exam.DoesNotExist:
-                logger.warning("Exam not found")
-                raise DRFValidationError(
-                    {'error': 'Exam not found'},
-                    code=status.HTTP_404_NOT_FOUND
-                )
-
-    @action(detail=False, methods=['post'], url_path='validate-exam')
-    def validate_exam_session(self, request):
-        student = request.user
-        exam_id = request.data.get('exam')
-        
-        if not exam_id:
-            return Response(
-                {'error': 'Exam ID is required'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        try:
-            exam = Exam.objects.get(id=exam_id)
-        except Exam.DoesNotExist:
-            return Response(
-                {'error': 'Exam not found'},
-                status=status.HTTP_404_NOT_FOUND
-            )
-
-        existing_session = ExamSession.objects.filter(
-            student=student, 
-            exam=exam, 
-            is_completed=False
-        ).first()
-        
-        if existing_session:
-            serializer = self.get_serializer(existing_session)
-            return Response(serializer.data)
-
-        session = ExamSession(student=student, exam=exam, is_completed=False)
-        try:
-            session.full_clean()
-            session.save()
-        except Exception as e:
-            return Response(
-                {'error': str(e)},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        serializer = self.get_serializer(session)
-        return Response(serializer.data)
+        qs = ExamSession.objects.all()
+        if user.user_type == 'student':
+            return qs.filter(student=user)
+        elif user.user_type == 'teacher':
+            return qs.filter(exam__subject__teacher=user)
+        return qs
 
     def create(self, request, *args, **kwargs):
         student = request.user
         exam_id = request.data.get('exam')
         if not exam_id:
-            return Response({'error': 'Exam required'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'error': 'Exam required'}, status=400)
 
-        try:
-            exam = Exam.objects.get(id=exam_id)
-        except Exam.DoesNotExist:
-            return Response({'error': 'Exam not found'}, status=status.HTTP_404_NOT_FOUND)
+        exam = get_object_or_404(Exam, id=exam_id)
 
+        # Strict mode: only allow one completed attempt
+        if exam.mode == 'strict':
+            if ExamSession.objects.filter(student=student, exam=exam, is_completed=True).exists():
+                return Response(
+                    {'error': 'Strict exam already completed. No retries allowed.'},
+                    status=400
+                )
+
+        # Prevent multiple active sessions
         existing_session = ExamSession.objects.filter(
-            student=student, 
-            exam=exam, 
-            is_completed=False
+            student=student, exam=exam, is_completed=False
         ).first()
-        
         if existing_session:
-            serializer = self.get_serializer(existing_session)
-            return Response(serializer.data, status=status.HTTP_200_OK)
+            return Response(
+                {'error': 'Active session already exists for this exam'},
+                status=400
+            )
 
         session = ExamSession(student=student, exam=exam, is_completed=False)
+
         try:
-            session.full_clean()
+            session.clean()
             session.save()
-        except Exception as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except ValidationError as e:
+            return Response({'error': str(e)}, status=400)
 
         serializer = self.get_serializer(session)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.data, status=201)
+
+    @action(detail=False, methods=['post'], url_path='validate-exam/(?P<exam_id>[0-9]+)')
+    def validate_session(self, request, exam_id=None):
+        student = request.user
+        exam = get_object_or_404(Exam, id=exam_id)
+
+        try:
+            if exam.mode == 'strict':
+                if ExamSession.objects.filter(student=student, exam=exam, is_completed=True).exists():
+                    return Response(
+                        {'error': 'Strict exam already completed. No retries allowed.'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+            session = ExamSession.objects.filter(
+                student=student, exam=exam, is_completed=False
+            ).first()
+
+            if not session:
+                session = ExamSession(student=student, exam=exam, is_completed=False)
+                session.clean()
+                session.save()
+
+            serializer = self.get_serializer(session)
+            return Response(serializer.data)
+
+        except ValidationError as e:
+            logger.error(f"[SessionValidationError] {str(e)}")
+            return Response(
+                {'error': 'Validation error: ' + str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            logger.error(f"[SessionValidationError] {str(e)}")
+            return Response(
+                {'error': 'Unable to validate session'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
     @action(detail=True, methods=['POST'])
     def start_exam(self, request, pk=None):
-        try:
-            session = self.get_object()
-            if session.student != request.user:
-                raise PermissionDenied("Invalid session owner")
-            if not session.start_time:
-                session.start_time = timezone.now()
-                session.save()
-            return Response({'status': 'exam started'})
-        except ExamSession.DoesNotExist:
-            return Response(
-                {'error': 'Session not found'}, 
-                status=status.HTTP_404_NOT_FOUND
-            )
+        session = self.get_object()
+        if session.student != request.user:
+            raise PermissionDenied("Invalid session owner")
+        if not session.start_time:
+            session.start_time = timezone.now()
+            session.save()
+        return Response({'status': 'exam started'})
 
     @action(detail=True, methods=['POST'], url_path='save_progress')
     def save_progress(self, request, pk=None):
@@ -470,30 +408,24 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
         elapsed_time = request.data.get('elapsed_time', 0)
 
         if not isinstance(answers_data, list):
-            return Response(
-                {'error': 'Answers must be a list'}, 
-                status=status.HTTP_400_BAD_REQUEST
+            return Response({'error': 'Answers must be a list'}, status=400)
+
+        Answer.objects.filter(session=session).delete()
+
+        for answer_data in answers_data:
+            question_id = answer_data.get('question')
+            selected_answers = answer_data.get('selected_answers', '')
+            if not question_id:
+                continue
+            Answer.objects.create(
+                session=session,
+                question_id=question_id,
+                selected_answers=selected_answers
             )
 
-        with transaction.atomic():
-            if answers_data:
-                Answer.objects.filter(session=session).delete()
-
-            for answer_data in answers_data:
-                question_id = answer_data.get('question')
-                selected_answers = answer_data.get('selected_answers', '')
-                if not question_id:
-                    continue
-                Answer.objects.create(
-                    session=session,
-                    question_id=question_id,
-                    selected_answers=selected_answers
-                )
-
-            session.elapsed_time = elapsed_time
-            session.save()
-            
-        return Response({'status': 'progress saved'}, status=status.HTTP_200_OK)
+        session.elapsed_time = elapsed_time
+        session.save()
+        return Response({'status': 'progress saved'}, status=200)
 
     @action(detail=True, methods=['POST'])
     def submit_exam(self, request, pk=None):
@@ -503,334 +435,66 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
         if session.student != user:
             raise PermissionDenied("Invalid session owner")
         if session.is_completed:
-            return Response(
-                {'error': 'Exam already submitted'}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({'error': 'Exam already submitted'}, status=400)
 
-        if session.exam.mode == 'practical':
-            return self._submit_practical_exam(session, request)
-        else:
-            return self._submit_mcq_exam(session, request)
-
-    def _submit_mcq_exam(self, session, request):
         answers_data = request.data.get('answers', [])
         elapsed_time = request.data.get('elapsed_time', 0)
         termination_reason = request.data.get('termination_reason', None)
 
         if not isinstance(answers_data, list):
-            return Response(
-                {'error': 'Answers must be a list'}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({'error': 'Answers must be a list'}, status=400)
 
-        with transaction.atomic():
-            if answers_data:
-                Answer.objects.filter(session=session).delete()
+        Answer.objects.filter(session=session).delete()
 
-            for answer_data in answers_data:
-                question_id = answer_data.get('question')
-                selected_answers = answer_data.get('selected_answers', '')
-                if not question_id:
-                    continue
-                Answer.objects.create(
-                    session=session,
-                    question_id=question_id,
-                    selected_answers=selected_answers
-                )
-
-            answers = Answer.objects.filter(session=session).select_related('question')
-            total_marks = 0
-            score = 0
-            details = {}
-
-            for answer in answers:
-                question = answer.question
-                total_marks += question.marks
-                correct_set = set(question.correct_option.split(','))
-                selected_set = set(answer.selected_answers.split(','))
-                is_correct = correct_set == selected_set
-                earned = question.marks if is_correct else 0
-                if is_correct:
-                    score += earned
-                details[question.id] = {
-                    'correct': list(correct_set),
-                    'selected': list(selected_set),
-                    'is_correct': is_correct,
-                    'marks': question.marks,
-                    'earned': earned
-                }
-
-            result = Result.objects.create(
+        for answer_data in answers_data:
+            question_id = answer_data.get('question')
+            selected_answers = answer_data.get('selected_answers', '')
+            if not question_id:
+                continue
+            Answer.objects.create(
                 session=session,
-                score=score,
-                total_marks=total_marks,
-                details=details
+                question_id=question_id,
+                selected_answers=selected_answers
             )
 
-            session.end_time = timezone.now()
-            session.is_completed = True
-            session.elapsed_time = elapsed_time
-            if termination_reason:
-                session.termination_reason = termination_reason
-            session.save()
-
-        return Response(ResultSerializer(result).data, status=status.HTTP_200_OK)
-
-    def _submit_practical_exam(self, session, request):
-        if session.is_completed:
-            return Response({'error': 'Exam already submitted'}, status=status.HTTP_400_BAD_REQUEST)
-        
-        if session.container_id:
-            try:
-                client = docker.from_env()
-                container = client.containers.get(session.container_id)
-                container.stop()
-                container.remove()
-                try:
-                    client.volumes.get(f'exam-home-{session.id}').remove()
-                except:
-                    pass
-            except:
-                pass
-        
-        answers = PracticalAnswer.objects.filter(session=session).select_related('task')
+        answers = Answer.objects.filter(session=session)
         total_marks = 0
         score = 0
         details = {}
-        
+
         for answer in answers:
-            task = answer.task
-            total_marks += task.marks
-            earned = task.marks if answer.is_verified else 0
-            score += earned
-            
-            details[str(task.id)] = {
-                'task_title': task.title,
-                'command_used': answer.command_used,
-                'is_verified': answer.is_verified,
-                'verification_output': answer.verification_output,
-                'marks': task.marks,
+            question = answer.question
+            total_marks += question.marks
+            correct_set = set(question.correct_option.split(','))
+            selected_set = set(answer.selected_answers.split(','))
+            is_correct = correct_set == selected_set
+            earned = question.marks if is_correct else 0
+            if is_correct:
+                score += earned
+            details[question.id] = {
+                'correct': list(correct_set),
+                'selected': list(selected_set),
+                'is_correct': is_correct,
+                'marks': question.marks,
                 'earned': earned
             }
-        
+
         result = Result.objects.create(
             session=session,
             score=score,
             total_marks=total_marks,
             details=details
         )
-        
+
         session.end_time = timezone.now()
         session.is_completed = True
+        if termination_reason:
+            session.termination_reason = termination_reason
         session.save()
-        
-        return Response(ResultSerializer(result).data)
 
-    @action(detail=True, methods=['post'], url_path='start-container')
-    def start_container(self, request, pk=None):
-        session = self.get_object()
-        
-        if session.container_id:
-            return Response({'status': 'container already running', 'container_id': session.container_id})
-        
-        try:
-            # Ensure exam has environments
-            if not session.exam.environments.exists():
-                return Response(
-                    {'error': 'No Docker environment configured for this exam'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            environment = session.exam.environments.first()
-            client = docker.from_env()
-            
-            # Create container with proper environment setup
-            container = client.containers.run(
-                environment.image,
-                command="/bin/sleep infinity",  # Keep container alive
-                detach=True,
-                tty=True,
-                stdin_open=True,
-                name=f"exam-session-{session.id}",
-                network_mode='none',
-                mem_limit='1g',
-                cpu_period=50000,
-                cpu_quota=25000,
-                volumes={'exam-home-{session.id}': {'bind': '/home/user', 'mode': 'rw'}},
-                user='user'
-            )
-            
-            # Execute setup script
-            exit_code, output = container.exec_run(
-                f"/bin/bash -c '{environment.setup_script}'",
-                user='root',
-                workdir='/'
-            )
-            
-            if exit_code != 0:
-                logger.error(f"Setup script failed: {output.decode('utf-8')}")
-                container.stop()
-                container.remove()
-                return Response(
-                    {'error': 'Failed to initialize environment'},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
-                )
-            
-            # Update session with container ID
-            session.container_id = container.id
-            session.save()
-            
-            return Response({
-                'status': 'container started',
-                'container_id': container.id,
-                'image': environment.image
-            })
-        except docker.errors.ImageNotFound:
-            return Response(
-                {'error': f'Docker image not found: {environment.image}'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        except docker.errors.DockerException as e:
-            logger.error(f"Docker error: {str(e)}")
-            return Response({'error': f'Docker error: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response(ResultSerializer(result).data, status=200)
 
-    @action(detail=True, methods=['post'], url_path='stop-container')
-    def stop_container(self, request, pk=None):
-        session = self.get_object()
-        
-        if not session.container_id:
-            return Response({'status': 'no container running'})
-        
-        try:
-            client = docker.from_env()
-            container = client.containers.get(session.container_id)
-            container.stop()
-            container.remove()
-            
-            try:
-                client.volumes.get(f'exam-home-{session.id}').remove()
-            except:
-                pass
-            
-            session.container_id = ''
-            session.save()
-            
-            return Response({'status': 'container stopped and removed'})
-        except docker.errors.NotFound:
-            session.container_id = ''
-            session.save()
-            return Response({'status': 'container not found, cleaned session'})
-        except docker.errors.DockerException as e:
-            logger.error(f"Docker error: {str(e)}")
-            return Response({'error': f'Docker error: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    @action(detail=True, methods=['post'], url_path='execute-command')
-    def execute_command(self, request, pk=None):
-        session = self.get_object()
-        command = request.data.get('command')
-        task_id = request.data.get('task_id')
-        
-        if not command:
-            return Response({'error': 'Command required'}, status=status.HTTP_400_BAD_REQUEST)
-        
-        if not session.container_id:
-            return Response({'error': 'Container not running'}, status=status.HTTP_400_BAD_REQUEST)
-        
-        try:
-            client = docker.from_env()
-            container = client.containers.get(session.container_id)
-            
-            # Execute command in container
-            exit_code, output = container.exec_run(
-                f"/bin/bash -c {shlex.quote(command)}",
-                user='user',
-                workdir='/home/user',
-                environment={'TERM': 'xterm-256color'},
-                demux=True
-            )
-            
-            stdout, stderr = output
-            stdout = stdout.decode('utf-8') if stdout else ''
-            stderr = stderr.decode('utf-8') if stderr else ''
-            
-            # Save command history
-            if task_id:
-                task = PracticalTask.objects.get(id=task_id)
-                PracticalAnswer.objects.update_or_create(
-                    session=session,
-                    task=task,
-                    defaults={'command_used': command, 'output': stdout + stderr}
-                )
-            
-            return Response({
-                'exit_code': exit_code,
-                'stdout': stdout,
-                'stderr': stderr
-            })
-        except docker.errors.NotFound:
-            return Response({'error': 'Container not found'}, status=status.HTTP_404_NOT_FOUND)
-        except PracticalTask.DoesNotExist:
-            return Response({'error': 'Invalid task ID'}, status=status.HTTP_400_BAD_REQUEST)
-
-    @action(detail=True, methods=['post'], url_path='verify-task')
-    def verify_task(self, request, pk=None):
-        session = self.get_object()
-        task_id = request.data.get('task_id')
-        
-        if not session.container_id:
-            return Response({'error': 'Container not running'}, status=status.HTTP_400_BAD_REQUEST)
-        
-        try:
-            task = PracticalTask.objects.get(id=task_id)
-            client = docker.from_env()
-            container = client.containers.get(session.container_id)
-            
-            # Run verification script
-            exit_code, output = container.exec_run(
-                f"/bin/bash -c '{task.verification_script}'",
-                user='root',
-                demux=True
-            )
-            
-            stdout, stderr = output
-            combined_output = (stdout.decode('utf-8') if stdout else '') + (stderr.decode('utf-8') if stderr else '')
-            
-            # Save verification result
-            PracticalAnswer.objects.update_or_create(
-                session=session,
-                task=task,
-                defaults={
-                    'is_verified': exit_code == 0,
-                    'verification_output': combined_output
-                }
-            )
-            
-            return Response({
-                'verified': exit_code == 0,
-                'output': combined_output
-            })
-        except PracticalTask.DoesNotExist:
-            return Response({'error': 'Invalid task ID'}, status=status.HTTP_400_BAD_REQUEST)
-
-class PracticalAnswerViewSet(viewsets.ModelViewSet):
-    queryset = PracticalAnswer.objects.all()
-    serializer_class = PracticalAnswerSerializer
-    authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]
-
-class ResultViewSet(viewsets.ReadOnlyModelViewSet):
-    serializer_class = ResultSerializer
-    permission_classes = [IsAuthenticated]
-    authentication_classes = [TokenAuthentication]
-    
-    def get_queryset(self):
-        user = self.request.user
-        if user.user_type == 'student':
-            return Result.objects.filter(session__student=user)
-        return Result.objects.filter(session__exam__subject__teacher=user)
-    
-    
 class AnswerViewSet(viewsets.ModelViewSet):
     serializer_class = AnswerSerializer
     permission_classes = [IsAuthenticated]
@@ -846,8 +510,6 @@ class AnswerViewSet(viewsets.ModelViewSet):
         if session.is_completed:
             raise ValidationError("Session already completed")
         serializer.save()
-
-
 
 class ResultViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = ResultSerializer
@@ -868,7 +530,6 @@ class ResultViewSet(viewsets.ReadOnlyModelViewSet):
     def list(self, request, *args, **kwargs):
         user = request.user
         queryset = self.get_queryset().select_related('session__exam', 'session__student')
-        
 
         result_list = []
         for result in queryset:
@@ -876,7 +537,6 @@ class ResultViewSet(viewsets.ReadOnlyModelViewSet):
             exam = session.exam
             student = session.student
 
-            # Right & wrong answers count
             answers_qs = Answer.objects.filter(session=session).select_related('question')
             right = 0
             wrong = 0
@@ -902,7 +562,8 @@ class ResultViewSet(viewsets.ReadOnlyModelViewSet):
                 'total_marks': result.total_marks,
                 'right_answers': right,
                 'wrong_answers': wrong,
-                'pass_fail': pass_fail
+                'pass_fail': pass_fail,
+                'termination_reason': session.termination_reason,  # ✅ Added here
             })
 
         return Response(result_list)
@@ -956,11 +617,12 @@ class ResultViewSet(viewsets.ReadOnlyModelViewSet):
             'right_answers': total_right,
             'wrong_answers': total_wrong,
             'result': pass_status,
+            'termination_reason': session.termination_reason,  # ✅ Added here
             'details': detailed_answers,
         }
 
         return Response(response_data)
-    
+
 
 def generate_otp():
     return str(random.randint(100000, 999999))
@@ -1009,3 +671,162 @@ class GetStudentEmailView(APIView):
             return Response({'email': student.email})
         except User.DoesNotExist:
             return Response({'error': 'Student not found'}, status=404)
+
+
+def get_docker_client():
+    return docker.from_env()
+
+class PracticalExamViewSet(viewsets.ModelViewSet):
+    queryset = PracticalExam.objects.all()
+    serializer_class = PracticalExamSerializer
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.user_type == 'student':
+            return PracticalExam.objects.filter(is_published=True)
+        return PracticalExam.objects.all()
+    
+
+class PracticalExamSessionViewSet(viewsets.ModelViewSet):
+    serializer_class = PracticalExamSessionSerializer
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.user_type == 'student':
+            return PracticalExamSession.objects.filter(student=user)
+        return PracticalExamSession.objects.all()
+
+    def create(self, request, *args, **kwargs):
+        user = request.user
+        exam_id = request.data.get('exam')
+        
+        if not exam_id:
+            return Response({'error': 'Exam ID is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            exam = PracticalExam.objects.get(id=exam_id, is_published=True)
+        except PracticalExam.DoesNotExist:
+            return Response({'error': 'Exam not found or not published'}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Check for existing active session
+        if PracticalExamSession.objects.filter(student=user, exam=exam, status='running').exists():
+            return Response({'error': 'You already have an active session for this exam'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Start Docker container
+        try:
+            client = get_docker_client()
+            container = client.containers.run(
+                image=exam.docker_image,
+                command=exam.setup_command,
+                detach=True,
+                tty=True,
+                stdin_open=True
+            )
+            container_id = container.id
+        except Exception as e:
+            logger.error(f"Failed to start container: {str(e)}")
+            return Response({'error': 'Failed to start exam environment'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+        # Create session
+        session = PracticalExamSession.objects.create(
+            student=user,
+            exam=exam,
+            container_id=container_id,
+            status='running'
+        )
+        
+        serializer = self.get_serializer(session)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'])
+    def verify(self, request, pk=None):
+        session = self.get_object()
+        if session.student != request.user:
+            raise PermissionDenied("You don't have permission for this session")
+        
+        if session.status != 'running':
+            return Response({'error': 'Session is not active'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Execute verification command
+        try:
+            client = get_docker_client()
+            container = client.containers.get(session.container_id)
+            exit_code, output = container.exec_run(session.exam.verification_command)
+            success = (exit_code == 0)
+        except Exception as e:
+            logger.error(f"Verification failed: {str(e)}")
+            return Response({'error': 'Verification process failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+        # Stop and remove container
+        try:
+            container.stop()
+            container.remove()
+        except Exception as e:
+            logger.error(f"Container cleanup failed: {str(e)}")
+        
+        # Update session
+        session.status = 'completed'
+        session.end_time = timezone.now()
+        session.verification_output = output.decode('utf-8')
+        session.is_success = success
+        session.save()
+        
+        # Create result
+        result = PracticalExamResult.objects.create(
+            session=session,
+            score=100 if success else 0,
+            total_possible=100,
+            details={
+                'verification_output': session.verification_output,
+                'success': success,
+                'exit_code': exit_code
+            }
+        )
+        
+        return Response({
+            'success': success,
+            'output': session.verification_output,
+            'result_id': result.id
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'])
+    def terminate(self, request, pk=None):
+        session = self.get_object()
+        if session.student != request.user:
+            raise PermissionDenied("You don't have permission for this session")
+        
+        if session.status != 'running':
+            return Response({'error': 'Session is not active'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        reason = request.data.get('reason', 'Terminated by student')
+        
+        # Stop and remove container
+        try:
+            client = get_docker_client()
+            container = client.containers.get(session.container_id)
+            container.stop()
+            container.remove()
+        except Exception as e:
+            logger.error(f"Container termination failed: {str(e)}")
+        
+        session.status = 'terminated'
+        session.end_time = timezone.now()
+        session.termination_reason = reason
+        session.save()
+        
+        return Response({'status': 'session terminated'}, status=status.HTTP_200_OK)
+
+class PracticalExamResultViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = PracticalExamResultSerializer
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.user_type == 'student':
+            return PracticalExamResult.objects.filter(session__student=user)
+        return PracticalExamResult.objects.all()

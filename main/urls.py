@@ -1,13 +1,13 @@
-from django.urls import path, include, re_path
+from django.urls import path, include
 from rest_framework import routers
 from .views import (
     UserViewSet, SubjectViewSet, QuestionViewSet,
     ExamViewSet, ExamSessionViewSet, AnswerViewSet,
     ResultViewSet, StudentViewSet, SendOTPView,
-    LoginView, ForcePasswordChangeView, VerifyOTPView, PracticalTaskViewSet,
-    DockerEnvironmentViewSet
+    LoginView, ForcePasswordChangeView, VerifyOTPView,
+    PracticalExamViewSet, PracticalExamSessionViewSet,
+    PracticalExamResultViewSet
 )
-from . import consumers
 
 router = routers.DefaultRouter()
 router.register(r'users', UserViewSet, basename='user')
@@ -18,8 +18,9 @@ router.register(r'sessions', ExamSessionViewSet, basename='session')
 router.register(r'answers', AnswerViewSet, basename='answer')
 router.register(r'results', ResultViewSet, basename='result')
 router.register(r'students', StudentViewSet, basename='student')
-router.register(r'tasks', PracticalTaskViewSet, basename='task')
-router.register(r'environments', DockerEnvironmentViewSet, basename='environment')
+router.register(r'practical-exams', PracticalExamViewSet, basename='PracticalExam')
+router.register(r'practical-sessions', PracticalExamSessionViewSet, basename='PracticalExamSession')
+router.register(r'practical-results', PracticalExamResultViewSet, basename='PracticalExamResult')
 
 urlpatterns = [
     path('', include(router.urls)),
@@ -29,10 +30,7 @@ urlpatterns = [
     path('exams/<int:pk>/unpublish/', ExamViewSet.as_view({'post': 'unpublish'}), name='exam-unpublish'),
     path('sessions/<int:pk>/start/', ExamSessionViewSet.as_view({'post': 'start_exam'}), name='session-start'),
     path('sessions/<int:pk>/submit/', ExamSessionViewSet.as_view({'post': 'submit_exam'}), name='session-submit'),
+    path('sessions/validate-exam/', ExamSessionViewSet.as_view({'post': 'validate_exam'}), name='validate-exam'),
     path('send-otp/', SendOTPView.as_view(), name='send_otp'),
     path('verify-otp/', VerifyOTPView.as_view(), name='verify_otp'),
-]
-
-websocket_urlpatterns = [
-    re_path(r'ws/practical/(?P<session_id>[0-9a-f-]+)/$', consumers.PracticalTerminalConsumer.as_asgi()),
 ]
