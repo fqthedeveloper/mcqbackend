@@ -1,3 +1,8 @@
+from datetime import time, timedelta
+import os
+import platform
+import tempfile
+import threading
 from django.shortcuts import get_object_or_404
 import docker
 from rest_framework import viewsets, status
@@ -23,10 +28,9 @@ from django.conf import settings
 import random
 
 
-User = get_user_model()
-
 logger = logging.getLogger(__name__)
 User = get_user_model()
+
 
 class UserViewSet(viewsets.ModelViewSet):
     queryset = User.objects.all()
@@ -145,10 +149,11 @@ class ForcePasswordChangeView(APIView):
             return Response({"message": "Password changed successfully."})
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+
+
 class SubjectViewSet(viewsets.ModelViewSet):
     queryset = Subject.objects.all()
     serializer_class = SubjectSerializer
-
 
 
 class QuestionViewSet(viewsets.ModelViewSet):
@@ -252,7 +257,6 @@ class QuestionViewSet(viewsets.ModelViewSet):
         except Exception as e:
             return Response({'status': 'error', 'message': str(e)}, status=400)
 
-
 class ExamViewSet(viewsets.ModelViewSet):
     queryset = Exam.objects.all()
     serializer_class = ExamSerializer
@@ -270,8 +274,10 @@ class ExamViewSet(viewsets.ModelViewSet):
         exam = self.get_object()
         exam.is_published = True
         exam.save()
+        
         message = request.data.get('message', f'New exam "{exam.title}" scheduled')
         students = User.objects.filter(user_type='student', is_active=True)
+        
         for student in students:
             if student.email:
                 send_mail(
@@ -281,7 +287,11 @@ class ExamViewSet(viewsets.ModelViewSet):
                     recipient_list=[student.email],
                     fail_silently=True,
                 )
-        return Response({'status': 'published', 'recipients': students.count()})
+        
+        return Response({
+            'status': 'published', 
+            'recipients': students.count()
+        })
 
     @action(detail=True, methods=['POST'])
     def unpublish(self, request, pk=None):
@@ -290,7 +300,6 @@ class ExamViewSet(viewsets.ModelViewSet):
         exam.save()
         return Response({'status': 'unpublished'})
 
-
 class ExamSessionViewSet(viewsets.ModelViewSet):
     serializer_class = ExamSessionSerializer
     permission_classes = [IsAuthenticated]
@@ -298,24 +307,28 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        qs = ExamSession.objects.all()
         if user.user_type == 'student':
-            return qs.filter(student=user)
+            return ExamSession.objects.filter(student=user)
         elif user.user_type == 'teacher':
-            return qs.filter(exam__subject__teacher=user)
-        return qs
+            return ExamSession.objects.filter(exam__subject__teacher=user)
+        return ExamSession.objects.all()
 
     def create(self, request, *args, **kwargs):
         student = request.user
         exam_id = request.data.get('exam')
+        
         if not exam_id:
             return Response({'error': 'Exam required'}, status=400)
 
         exam = get_object_or_404(Exam, id=exam_id)
 
-        # Strict mode: only allow one completed attempt
+        # Strict mode validation
         if exam.mode == 'strict':
-            if ExamSession.objects.filter(student=student, exam=exam, is_completed=True).exists():
+            if ExamSession.objects.filter(
+                student=student, 
+                exam=exam, 
+                is_completed=True
+            ).exists():
                 return Response(
                     {'error': 'Strict exam already completed. No retries allowed.'},
                     status=400
@@ -323,8 +336,11 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
 
         # Prevent multiple active sessions
         existing_session = ExamSession.objects.filter(
-            student=student, exam=exam, is_completed=False
+            student=student, 
+            exam=exam, 
+            is_completed=False
         ).first()
+        
         if existing_session:
             return Response(
                 {'error': 'Active session already exists for this exam'},
@@ -341,40 +357,56 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
 
         serializer = self.get_serializer(session)
         return Response(serializer.data, status=201)
-
+    
     @action(detail=False, methods=['post'], url_path='validate-exam/(?P<exam_id>[0-9]+)')
-    def validate_session(self, request, exam_id=None):
+    def validate_exam(self, request, exam_id=None):
         student = request.user
-        exam = get_object_or_404(Exam, id=exam_id)
+        
+        try:
+            exam = Exam.objects.get(id=exam_id)
+        except Exam.DoesNotExist:
+            return Response(
+                {'error': 'Exam not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
 
         try:
+            # Strict mode validation
             if exam.mode == 'strict':
-                if ExamSession.objects.filter(student=student, exam=exam, is_completed=True).exists():
+                if ExamSession.objects.filter(
+                    student=student,
+                    exam=exam,
+                    is_completed=True
+                ).exists():
                     return Response(
                         {'error': 'Strict exam already completed. No retries allowed.'},
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
+            # Find existing incomplete session
             session = ExamSession.objects.filter(
-                student=student, exam=exam, is_completed=False
+                student=student,
+                exam=exam,
+                is_completed=False
             ).first()
 
+            # Create new session if none exists
             if not session:
                 session = ExamSession(student=student, exam=exam, is_completed=False)
                 session.clean()
                 session.save()
 
-            serializer = self.get_serializer(session)
+            serializer = ExamSessionSerializer(session)
             return Response(serializer.data)
 
         except ValidationError as e:
             logger.error(f"[SessionValidationError] {str(e)}")
             return Response(
-                {'error': 'Validation error: ' + str(e)},
+                {'error': f'Validation error: {str(e)}'},
                 status=status.HTTP_400_BAD_REQUEST
             )
         except Exception as e:
-            logger.error(f"[SessionValidationError] {str(e)}")
+            logger.exception(f"[SessionValidationError] Unexpected error: {str(e)}")
             return Response(
                 {'error': 'Unable to validate session'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -385,10 +417,15 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
         session = self.get_object()
         if session.student != request.user:
             raise PermissionDenied("Invalid session owner")
+        
         if not session.start_time:
             session.start_time = timezone.now()
             session.save()
-        return Response({'status': 'exam started'})
+            
+        return Response({
+            'status': 'exam started',
+            'start_time': session.start_time
+        })
 
     @action(detail=True, methods=['POST'], url_path='save_progress')
     def save_progress(self, request, pk=None):
@@ -410,21 +447,24 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
         if not isinstance(answers_data, list):
             return Response({'error': 'Answers must be a list'}, status=400)
 
+        # Delete existing answers
         Answer.objects.filter(session=session).delete()
 
+        # Create new answers
         for answer_data in answers_data:
             question_id = answer_data.get('question')
             selected_answers = answer_data.get('selected_answers', '')
-            if not question_id:
-                continue
-            Answer.objects.create(
-                session=session,
-                question_id=question_id,
-                selected_answers=selected_answers
-            )
+            
+            if question_id:
+                Answer.objects.create(
+                    session=session,
+                    question_id=question_id,
+                    selected_answers=selected_answers
+                )
 
         session.elapsed_time = elapsed_time
         session.save()
+        
         return Response({'status': 'progress saved'}, status=200)
 
     @action(detail=True, methods=['POST'])
@@ -434,6 +474,7 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
 
         if session.student != user:
             raise PermissionDenied("Invalid session owner")
+            
         if session.is_completed:
             return Response({'error': 'Exam already submitted'}, status=400)
 
@@ -441,22 +482,20 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
         elapsed_time = request.data.get('elapsed_time', 0)
         termination_reason = request.data.get('termination_reason', None)
 
-        if not isinstance(answers_data, list):
-            return Response({'error': 'Answers must be a list'}, status=400)
-
+        # Save answers
         Answer.objects.filter(session=session).delete()
-
         for answer_data in answers_data:
             question_id = answer_data.get('question')
             selected_answers = answer_data.get('selected_answers', '')
-            if not question_id:
-                continue
-            Answer.objects.create(
-                session=session,
-                question_id=question_id,
-                selected_answers=selected_answers
-            )
+            
+            if question_id:
+                Answer.objects.create(
+                    session=session,
+                    question_id=question_id,
+                    selected_answers=selected_answers
+                )
 
+        # Calculate results
         answers = Answer.objects.filter(session=session)
         total_marks = 0
         score = 0
@@ -465,12 +504,14 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
         for answer in answers:
             question = answer.question
             total_marks += question.marks
+            
             correct_set = set(question.correct_option.split(','))
-            selected_set = set(answer.selected_answers.split(','))
+            selected_set = set(answer.selected_answers.split(',')) if answer.selected_answers else set()
+            
             is_correct = correct_set == selected_set
             earned = question.marks if is_correct else 0
-            if is_correct:
-                score += earned
+            score += earned
+            
             details[question.id] = {
                 'correct': list(correct_set),
                 'selected': list(selected_set),
@@ -479,6 +520,7 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
                 'earned': earned
             }
 
+        # Create result
         result = Result.objects.create(
             session=session,
             score=score,
@@ -486,14 +528,17 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
             details=details
         )
 
+        # Complete session
         session.end_time = timezone.now()
         session.is_completed = True
+        session.elapsed_time = elapsed_time
+        
         if termination_reason:
             session.termination_reason = termination_reason
+            
         session.save()
 
         return Response(ResultSerializer(result).data, status=200)
-
 
 class AnswerViewSet(viewsets.ModelViewSet):
     serializer_class = AnswerSerializer
@@ -504,7 +549,7 @@ class AnswerViewSet(viewsets.ModelViewSet):
         return Answer.objects.filter(session__student=self.request.user)
 
     def perform_create(self, serializer):
-        session = serializer.validated_data.get('session')
+        session = serializer.validated_data['session']
         if session.student != self.request.user:
             raise PermissionDenied("Invalid session owner")
         if session.is_completed:
@@ -522,69 +567,24 @@ class ResultViewSet(viewsets.ReadOnlyModelViewSet):
             return Result.objects.filter(session__student=user)
         return Result.objects.all()
 
-    def get(self, request, session):
-        result = get_object_or_404(Result, session=session, user=request.user)
-        serializer = ResultSerializer(result, context={'request': request})
-        return Response(serializer.data)
-
-    def list(self, request, *args, **kwargs):
-        user = request.user
-        queryset = self.get_queryset().select_related('session__exam', 'session__student')
-
-        result_list = []
-        for result in queryset:
-            session = result.session
-            exam = session.exam
-            student = session.student
-
-            answers_qs = Answer.objects.filter(session=session).select_related('question')
-            right = 0
-            wrong = 0
-            for answer in answers_qs:
-                q = answer.question
-                correct = q.correct_option.split(',') if ',' in q.correct_option else [q.correct_option]
-                selected = answer.selected_answers.split(',') if answer.selected_answers else []
-                if sorted(correct) == sorted(selected):
-                    right += 1
-                else:
-                    wrong += 1
-
-            percentage = (result.score / result.total_marks) * 100 if result.total_marks else 0
-            pass_fail = "Pass" if percentage >= 80 else "Fail"
-
-            result_list.append({
-                'id': result.id,
-                'session': session.id,
-                'exam_title': exam.title,
-                'student_name': student.get_full_name() or student.username,
-                'date': session.end_time.isoformat() if session.end_time else None,
-                'score': result.score,
-                'total_marks': result.total_marks,
-                'right_answers': right,
-                'wrong_answers': wrong,
-                'pass_fail': pass_fail,
-                'termination_reason': session.termination_reason,  # ✅ Added here
-            })
-
-        return Response(result_list)
-
     @action(detail=False, methods=['GET'], url_path='session/(?P<session_id>[0-9]+)')
     def by_session(self, request, session_id=None):
         session = get_object_or_404(ExamSession, id=session_id)
         user = request.user
 
+        # Authorization check
         if user.user_type == 'student' and session.student != user:
             return Response({'error': 'Permission denied'}, status=403)
 
         result = get_object_or_404(Result, session=session)
-        exam = session.exam
-        answers_qs = Answer.objects.filter(session=session).select_related('question')
-
+        answers = Answer.objects.filter(session=session).select_related('question')
+        
+        # Calculate results
         total_right = 0
         total_wrong = 0
         detailed_answers = {}
 
-        for answer in answers_qs:
+        for answer in answers:
             q = answer.question
             correct = q.correct_option.split(',') if ',' in q.correct_option else [q.correct_option]
             selected = answer.selected_answers.split(',') if answer.selected_answers else []
@@ -602,27 +602,25 @@ class ResultViewSet(viewsets.ReadOnlyModelViewSet):
                 'is_correct': is_correct,
                 'marks': q.marks,
                 'earned': q.marks if is_correct else 0,
-                'explanation': getattr(q, 'explanation', '')
+                'explanation': q.explanation or ''
             }
 
+        # Prepare response
         pass_status = "Pass" if result.score >= (0.8 * result.total_marks) else "Fail"
-
-        response_data = {
-            'exam_title': exam.title,
+        
+        return Response({
+            'exam_title': session.exam.title,
             'submitted_at': session.end_time,
-            'duration': exam.duration,
+            'duration': session.exam.duration,
             'student_name': session.student.get_full_name() or session.student.username,
             'score': result.score,
             'total_marks': result.total_marks,
             'right_answers': total_right,
             'wrong_answers': total_wrong,
             'result': pass_status,
-            'termination_reason': session.termination_reason,  # ✅ Added here
+            'termination_reason': session.termination_reason,
             'details': detailed_answers,
-        }
-
-        return Response(response_data)
-
+        })
 
 def generate_otp():
     return str(random.randint(100000, 999999))
@@ -634,14 +632,18 @@ class SendOTPView(APIView):
         user = request.user
         otp = generate_otp()
 
-        EmailOTP.objects.update_or_create(user=user, defaults={'otp': otp})
+        EmailOTP.objects.update_or_create(
+            user=user, 
+            defaults={'otp': otp, 'created_at': timezone.now()}
+        )
+        
         send_mail(
-                'Your IRT MCQ APP OTP Code',
-                f'Your OTP is {otp}',
-                'noreply@example.com',
-                [user.email],
-                fail_silently=False,  # fix the typo here
-            )
+            'Your Exam Platform OTP Code',
+            f'Your OTP is {otp}',
+            settings.DEFAULT_FROM_EMAIL,
+            [user.email],
+            fail_silently=False,
+        )
         return Response({'message': 'OTP sent successfully'})
 
 class VerifyOTPView(APIView):
@@ -653,6 +655,10 @@ class VerifyOTPView(APIView):
 
         try:
             email_otp = EmailOTP.objects.get(user=user)
+            # Check expiration (5 minutes)
+            if timezone.now() > email_otp.created_at + timedelta(minutes=5):
+                return Response({'error': 'OTP expired'}, status=400)
+                
             if email_otp.otp == otp:
                 user.is_verified = True
                 user.save()
@@ -662,19 +668,16 @@ class VerifyOTPView(APIView):
         except EmailOTP.DoesNotExist:
             return Response({'error': 'OTP not sent'}, status=400)
 
+
 class GetStudentEmailView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, user_id):
         try:
-            student = User.objects.get(id=user_id, role='student')
+            student = User.objects.get(id=user_id, user_type='student')
             return Response({'email': student.email})
         except User.DoesNotExist:
             return Response({'error': 'Student not found'}, status=404)
-
-
-def get_docker_client():
-    return docker.from_env()
 
 class PracticalExamViewSet(viewsets.ModelViewSet):
     queryset = PracticalExam.objects.all()
@@ -687,12 +690,12 @@ class PracticalExamViewSet(viewsets.ModelViewSet):
         if user.user_type == 'student':
             return PracticalExam.objects.filter(is_published=True)
         return PracticalExam.objects.all()
-    
 
 class PracticalExamSessionViewSet(viewsets.ModelViewSet):
     serializer_class = PracticalExamSessionSerializer
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
+    http_method_names = ['get', 'post', 'delete', 'head', 'options', 'trace']
 
     def get_queryset(self):
         user = self.request.user
@@ -700,125 +703,146 @@ class PracticalExamSessionViewSet(viewsets.ModelViewSet):
             return PracticalExamSession.objects.filter(student=user)
         return PracticalExamSession.objects.all()
 
+    @action(detail=True, methods=['get'])
+    def token(self, request, pk=None):
+        session = self.get_object()
+        return Response({'token': session.token})
+
     def create(self, request, *args, **kwargs):
         user = request.user
         exam_id = request.data.get('exam')
         
         if not exam_id:
-            return Response({'error': 'Exam ID is required'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'error': 'Exam ID required'}, status=status.HTTP_400_BAD_REQUEST)
         
         try:
             exam = PracticalExam.objects.get(id=exam_id, is_published=True)
         except PracticalExam.DoesNotExist:
-            return Response({'error': 'Exam not found or not published'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({
+                'error': 'Exam not found or not published'
+            }, status=status.HTTP_404_NOT_FOUND)
         
-        # Check for existing active session
-        if PracticalExamSession.objects.filter(student=user, exam=exam, status='running').exists():
-            return Response({'error': 'You already have an active session for this exam'}, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Start Docker container
-        try:
-            client = get_docker_client()
-            container = client.containers.run(
-                image=exam.docker_image,
-                command=exam.setup_command,
-                detach=True,
-                tty=True,
-                stdin_open=True
-            )
-            container_id = container.id
-        except Exception as e:
-            logger.error(f"Failed to start container: {str(e)}")
-            return Response({'error': 'Failed to start exam environment'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        
-        # Create session
-        session = PracticalExamSession.objects.create(
-            student=user,
-            exam=exam,
-            container_id=container_id,
+        active_session = PracticalExamSession.objects.filter(
+            student=user, 
+            exam=exam, 
             status='running'
-        )
+        ).first()
         
-        serializer = self.get_serializer(session)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        if active_session:
+            return Response({
+                'error': 'Active session already exists',
+                'session_id': active_session.id
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            session = PracticalExamSession.objects.create(
+                student=user,
+                exam=exam,
+                status='running'
+            )
+            
+            def start_container_task():
+                try:
+                    session.start_container()
+                except Exception as e:
+                    session.status = 'terminated'
+                    session.termination_reason = str(e)
+                    session.save()
+            
+            threading.Thread(target=start_container_task).start()
+            
+            return Response(self.get_serializer(session).data, status=status.HTTP_201_CREATED)
+        except Exception as e:
+            logger.exception("Session creation failed")
+            return Response({
+                'error': 'Session creation failed',
+                'details': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'])
     def verify(self, request, pk=None):
         session = self.get_object()
-        if session.student != request.user:
-            raise PermissionDenied("You don't have permission for this session")
+        user = request.user
+        
+        if session.student != user:
+            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
         
         if session.status != 'running':
-            return Response({'error': 'Session is not active'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({
+                'error': 'Session not active',
+                'current_status': session.status
+            }, status=status.HTTP_400_BAD_REQUEST)
         
-        # Execute verification command
         try:
-            client = get_docker_client()
-            container = client.containers.get(session.container_id)
-            exit_code, output = container.exec_run(session.exam.verification_command)
-            success = (exit_code == 0)
+            output = session.execute_command(session.exam.verification_command)
+            success = True
+            
+            session.status = 'completed'
+            session.end_time = timezone.now()
+            session.verification_output = output[:10000]
+            session.is_success = success
+            session.save()
+            
+            exam_result = PracticalExamResult.objects.create(
+                session=session,
+                score=100 if success else 0,
+                total_possible=100,
+                details={
+                    'output': output[:5000],
+                    'command': session.exam.verification_command
+                }
+            )
+            
+            session.terminate_container()
+            
+            return Response(PracticalExamResultSerializer(exam_result).data)
         except Exception as e:
-            logger.error(f"Verification failed: {str(e)}")
-            return Response({'error': 'Verification process failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        
-        # Stop and remove container
-        try:
-            container.stop()
-            container.remove()
-        except Exception as e:
-            logger.error(f"Container cleanup failed: {str(e)}")
-        
-        # Update session
-        session.status = 'completed'
-        session.end_time = timezone.now()
-        session.verification_output = output.decode('utf-8')
-        session.is_success = success
-        session.save()
-        
-        # Create result
-        result = PracticalExamResult.objects.create(
-            session=session,
-            score=100 if success else 0,
-            total_possible=100,
-            details={
-                'verification_output': session.verification_output,
-                'success': success,
-                'exit_code': exit_code
-            }
-        )
-        
-        return Response({
-            'success': success,
-            'output': session.verification_output,
-            'result_id': result.id
-        }, status=status.HTTP_200_OK)
+            logger.exception("Verification failed")
+            return Response({
+                'error': 'Verification failed',
+                'details': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'])
     def terminate(self, request, pk=None):
         session = self.get_object()
-        if session.student != request.user:
-            raise PermissionDenied("You don't have permission for this session")
+        user = request.user
+        
+        if session.student != user:
+            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
         
         if session.status != 'running':
-            return Response({'error': 'Session is not active'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({
+                'error': 'Session not active',
+                'current_status': session.status
+            }, status=status.HTTP_400_BAD_REQUEST)
         
-        reason = request.data.get('reason', 'Terminated by student')
+        reason = request.data.get('reason', 'Terminated by student')[:200]
         
-        # Stop and remove container
         try:
-            client = get_docker_client()
-            container = client.containers.get(session.container_id)
-            container.stop()
-            container.remove()
+            session.terminate_container()
+            session.status = 'terminated'
+            session.end_time = timezone.now()
+            session.termination_reason = reason
+            session.save()
+            
+            return Response({
+                'status': 'terminated',
+                'session_id': session.id,
+                'termination_reason': reason
+            })
         except Exception as e:
-            logger.error(f"Container termination failed: {str(e)}")
-        
-        session.status = 'terminated'
-        session.end_time = timezone.now()
-        session.termination_reason = reason
-        session.save()
-        
-        return Response({'status': 'session terminated'}, status=status.HTTP_200_OK)
+            logger.exception("Termination failed")
+            return Response({
+                'error': 'Termination failed',
+                'details': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    def destroy(self, request, *args, **kwargs):
+        session = self.get_object()
+        if session.status == 'running':
+            session.terminate_container()
+        return super().destroy(request, *args, **kwargs)
 
 class PracticalExamResultViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = PracticalExamResultSerializer

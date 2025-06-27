@@ -36,7 +36,7 @@ class ResultAdmin(admin.ModelAdmin):
 
 @admin.register(PracticalExam)
 class PracticalExamAdmin(admin.ModelAdmin):
-    list_display = ['title', 'docker_image', 'description', 'created_at', 'is_published']
+    list_display = ['title', 'description', 'created_at', 'is_published']
 
 @admin.register(PracticalExamSession)
 class PracticalExamSessionAdmin(admin.ModelAdmin):

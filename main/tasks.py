@@ -1,8 +1,11 @@
 # tasks.py
+from datetime import timedelta
 from celery import shared_task
 import docker
 from django.utils import timezone
-from .models import ExamSession
+
+from main.views import get_docker_client
+from .models import ExamSession, PracticalExamSession
 import logging
 
 logger = logging.getLogger(__name__)
@@ -10,28 +13,29 @@ logger = logging.getLogger(__name__)
 @shared_task
 def cleanup_expired_containers():
     try:
-        client = docker.from_env()
-        expired_sessions = ExamSession.objects.filter(
-            is_completed=False,
-            start_time__lt=timezone.now() - timezone.timedelta(hours=6)
-        ).exclude(container_id='')
-
+        client = get_docker_client()
+        cutoff = timezone.now() - timedelta(hours=6)
+        
+        expired_sessions = PracticalExamSession.objects.filter(
+            status='running',
+            start_time__lt=cutoff
+        )
+        
         for session in expired_sessions:
             try:
                 container = client.containers.get(session.container_id)
-                container.stop()
+                container.stop(timeout=5)
                 container.remove()
-                try:
-                    client.volumes.get(f'exam-home-{session.id}').remove()
-                except:
-                    pass
             except docker.errors.NotFound:
-                pass
+                pass  # Already removed
             except Exception as e:
-                logger.error(f"Container cleanup error for session {session.id}: {str(e)}")
+                logger.error(f"Cleanup error: {str(e)}")
             
-            session.container_id = ''
-            session.termination_reason = 'Automated cleanup'
+            session.status = 'terminated'
+            session.termination_reason = 'System timeout'
             session.save()
+            
+        logger.info(f"Cleaned up {expired_sessions.count()} expired sessions")
+        
     except Exception as e:
-        logger.error(f"Container cleanup task error: {str(e)}")
+        logger.error(f"Cleanup task failed: {str(e)}")
