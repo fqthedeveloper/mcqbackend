@@ -325,7 +325,7 @@ class ResultSerializer(serializers.ModelSerializer):
 
 
 class PracticalExamSerializer(serializers.ModelSerializer):
-    subject_name = serializers.CharField(source='subject.name', read_only=True)
+    subject_name = serializers.CharField(source='subject.name', read_only=True)    
     
     class Meta:
         model = PracticalExam
@@ -348,6 +348,7 @@ class PracticalExamSessionSerializer(serializers.ModelSerializer):
             'is_success': {'read_only': True},
             'termination_reason': {'read_only': True},
         }
+
 
 class PracticalExamResultSerializer(serializers.ModelSerializer):
     session_info = serializers.SerializerMethodField()

@@ -711,27 +711,43 @@ class PracticalExamSessionViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'])
     def container_status(self, request, pk=None):
         session = self.get_object()
-        return Response({'status': session.get_container_status()})
+        return Response({
+            'status': session.get_container_status(),
+            'container_id': session.container_id
+        })
     
     @action(detail=True, methods=['post'])
     def restart_container(self, request, pk=None):
         session = self.get_object()
         try:
-            # Remove existing container
+            # Force remove existing container if any
             if session.container_id:
                 try:
                     client = docker.from_env()
-                    container = client.containers.get(session.container_id)
-                    container.remove(force=True)
-                except docker.errors.NotFound:
-                    pass
+                    try:
+                        container = client.containers.get(session.container_id)
+                        container.stop(timeout=1)
+                        container.remove(force=True)
+                    except docker.errors.NotFound:
+                        pass
+                except Exception as e:
+                    logger.error(f"Container removal error: {str(e)}")
             
-            # Create new container
+            # Reset session container info
             session.container_id = None
+            session.verification_output = None
+            session.is_success = False
+            session.termination_reason = None
+            session.status = 'running'
             session.save()
-            session.start_container()
             
-            return Response({'status': 'restarted'})
+            # Start new container in background thread
+            threading.Thread(target=session.start_container).start()
+            
+            return Response({
+                'status': 'restarting',
+                'message': 'Container is being restarted'
+            })
         except Exception as e:
             logger.exception("Container restart failed")
             return Response({
@@ -747,23 +763,28 @@ class PracticalExamSessionViewSet(viewsets.ModelViewSet):
             return Response({'error': 'Exam ID required'}, status=status.HTTP_400_BAD_REQUEST)
         
         try:
+            # Check for existing session
+            existing_session = PracticalExamSession.objects.filter(
+                student=user, 
+                exam_id=exam_id,
+                status='running'
+            ).first()
+            
+            if existing_session:
+                return Response(
+                    PracticalExamSessionSerializer(existing_session).data,
+                    status=status.HTTP_200_OK
+                )
+            
+            # Create new session
             session = PracticalExamSession.objects.create(
                 student=user,
                 exam_id=exam_id,
-                status='running'
+                status='starting'  # New initial status
             )
             
             # Start container in background thread
-            def start_container_task():
-                try:
-                    session.start_container()
-                except Exception as e:
-                    session.status = 'terminated'
-                    session.termination_reason = str(e)
-                    session.save()
-                    logger.error(f"Container startup failed: {str(e)}")
-            
-            threading.Thread(target=start_container_task).start()
+            threading.Thread(target=session.start_container).start()
             
             return Response(
                 PracticalExamSessionSerializer(session).data, 
@@ -791,31 +812,15 @@ class PracticalExamSessionViewSet(viewsets.ModelViewSet):
             }, status=status.HTTP_400_BAD_REQUEST)
         
         try:
-            # Execute verification command
             output = session.execute_command(session.exam.verification_command)
-            
-            # Check success
             success = "success" in output.lower() or "ok" in output.lower()
             
-            # Update session
             session.status = 'completed'
             session.end_time = timezone.now()
             session.verification_output = output[:10000]
             session.is_success = success
             session.save()
             
-            # Create result
-            result = PracticalExamResult.objects.create(
-                session=session,
-                score=100 if success else 0,
-                total_possible=100,
-                details={
-                    'command': session.exam.verification_command,
-                    'output': output[:5000]
-                }
-            )
-            
-            # Terminate container
             session.terminate_container()
             
             return Response({
@@ -868,7 +873,8 @@ class PracticalExamSessionViewSet(viewsets.ModelViewSet):
         session = self.get_object()
         if session.status == 'running':
             session.terminate_container()
-        return super().destroy(request, *args, **kwargs)    
+        return super().destroy(request, *args, **kwargs)
+    
 
 
 class PracticalExamResultViewSet(viewsets.ReadOnlyModelViewSet):

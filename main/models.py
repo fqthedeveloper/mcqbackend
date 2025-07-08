@@ -6,10 +6,8 @@ from django.db import models
 from django.contrib.auth.models import AbstractUser
 from django.utils import timezone
 import os
-import shutil
 from django.utils import timezone
 import docker
-from requests import session
 
 
 
@@ -179,13 +177,13 @@ class PracticalExam(models.Model):
 
     def __str__(self):
         return self.title
-
-
 class PracticalExamSession(models.Model):
     STATUS_CHOICES = (
+        ('starting', 'Starting'),  # New status
         ('running', 'Running'),
         ('completed', 'Completed'),
         ('terminated', 'Terminated'),
+        ('failed', 'Failed'),  # New status for startup failures
     )
     
     student = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
@@ -193,11 +191,12 @@ class PracticalExamSession(models.Model):
     container_id = models.CharField(max_length=64, null=True, blank=True)
     start_time = models.DateTimeField(auto_now_add=True)
     end_time = models.DateTimeField(null=True, blank=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='running')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='starting')  # Updated default
     verification_output = models.TextField(blank=True, null=True)
     is_success = models.BooleanField(default=False)
     termination_reason = models.TextField(null=True, blank=True)
     token = models.CharField(max_length=100, default=secrets.token_urlsafe, unique=True)
+    startup_log = models.TextField(blank=True, null=True)  # Store startup logs
 
     class Meta:
         unique_together = [('student', 'exam')]
@@ -208,34 +207,32 @@ class PracticalExamSession(models.Model):
     
     def start_container(self):
         """Create and start a Docker container for the exam session"""
+        log_lines = []
+        
         try:
-            # Initialize Docker client based on OS
-            if os.name == 'nt':  # Windows
-                client = docker.DockerClient(base_url='tcp://localhost:2375', timeout=300)
-            else:  # Linux/Mac
-                client = docker.from_env(timeout=300)
+            client = docker.from_env(timeout=300)
+            log_lines.append(f"Docker client initialized")
             
-            # Prepare environment variables
             environment = {
                 **self.exam.environment_vars,
                 "STUDENT_ID": str(self.student.id),
                 "EXAM_ID": str(self.exam.id),
-                "TERM": "xterm-256color"  # For proper terminal emulation
+                "TERM": "xterm-256color"
             }
             
-            # Create volume path with OS-specific handling
             volume_path = os.path.join(settings.BASE_DIR, 'exam_data', str(self.id))
             os.makedirs(volume_path, exist_ok=True)
+            log_lines.append(f"Created volume path: {volume_path}")
             
-            # Convert Windows paths to Docker-compatible format
             if os.name == 'nt':
                 volume_path = volume_path.replace('\\', '/').replace(':', '')
                 volume_path = f'/{volume_path}'
+                log_lines.append(f"Converted Windows path: {volume_path}")
             
-            # Create and start container
+            # Run container
             container = client.containers.run(
                 image=self.exam.docker_image,
-                command="sleep infinity",  # Keep container running
+                command="sleep infinity",
                 detach=True,
                 tty=True,
                 environment=environment,
@@ -244,99 +241,108 @@ class PracticalExamSession(models.Model):
                 name=f"practical-exam-{self.id}",
                 stdin_open=True,
             )
+            log_lines.append(f"Container created: {container.id}")
             
-            # Save container ID
             self.container_id = container.id
+            self.status = 'running'
             self.save()
+            log_lines.append("Container ID saved to session")
             
-            # Wait for container to start
-            self._wait_for_container(client, container)
+            # Wait for container to be fully started
+            self._wait_for_container(client, container, log_lines)
             
             # Execute setup command if defined
             if self.exam.setup_command:
-                self._execute_setup_command(client, container)
+                log_lines.append(f"Executing setup command: {self.exam.setup_command}")
+                self._execute_setup_command(client, container, log_lines)
+                
+            log_lines.append("Container started successfully")
             
-            return container
-        
         except docker.errors.ImageNotFound:
-            logger.error(f"🚫 Image not found: {self.exam.docker_image}")
-            raise Exception(f"Docker image '{self.exam.docker_image}' not available. Contact administrator.")
+            error_msg = f"Image not found: {self.exam.docker_image}"
+            log_lines.append(error_msg)
+            self.status = 'failed'
+            self.termination_reason = error_msg
+            logger.error(error_msg)
         except docker.errors.APIError as e:
-            logger.error(f"🚫 Docker API error: {str(e)}")
-            raise Exception(f"Docker service error: {str(e)}")
+            error_msg = f"Docker API error: {str(e)}"
+            log_lines.append(error_msg)
+            self.status = 'failed'
+            self.termination_reason = error_msg
+            logger.error(error_msg)
         except Exception as e:
-            logger.exception("🚫 Container startup failed")
-            raise Exception(f"Failed to start exam environment: {str(e)}")
+            error_msg = f"Container startup failed: {str(e)}"
+            log_lines.append(error_msg)
+            self.status = 'failed'
+            self.termination_reason = error_msg
+            logger.exception("Container startup failed")
+        finally:
+            self.startup_log = "\n".join(log_lines)
+            self.save()
     
-    def _wait_for_container(self, client, container, max_retries=15, delay=1):
+    def _wait_for_container(self, client, container, log_lines, max_retries=20, delay=2):
         """Wait for container to reach running state"""
-        for _ in range(max_retries):
+        for i in range(max_retries):
             try:
                 container.reload()
                 if container.status == 'running':
-                    logger.info(f"✅ Container started: {container.id}")
+                    log_lines.append(f"Container running after {i+1} checks")
                     return
-                time.sleep(delay)
+                log_lines.append(f"Container status: {container.status} (check {i+1})")
             except docker.errors.NotFound:
-                raise Exception("Container disappeared during startup")
-        raise Exception("Timed out waiting for container to start")
+                log_lines.append(f"Container not found during check {i+1}")
+            except Exception as e:
+                log_lines.append(f"Error checking container: {str(e)}")
+                
+            time.sleep(delay)
+        
+        error_msg = f"Timed out waiting for container to start after {max_retries*delay} seconds"
+        log_lines.append(error_msg)
+        raise Exception(error_msg)
     
-    def _execute_setup_command(self, client, container):
-        """Execute the exam's setup command inside the container"""
+    def _execute_setup_command(self, client, container, log_lines):
+        """Execute setup command in container"""
         try:
             exit_code, output = container.exec_run(
                 cmd=self.exam.setup_command,
                 workdir="/exam",
                 tty=True
             )
+            output = output.decode('utf-8') if isinstance(output, bytes) else output
+            log_lines.append(f"Setup command executed. Exit code: {exit_code}")
+            log_lines.append(f"Command output:\n{output[:1000]}")
+            
             if exit_code != 0:
-                logger.warning(f"⚠️ Setup command exited with code {exit_code}")
-            else:
-                logger.info(f"✅ Setup command executed successfully")
+                log_lines.append(f"Warning: Setup command exited with code {exit_code}")
         except Exception as e:
-            logger.error(f"🚫 Setup command failed: {str(e)}")
-            raise Exception(f"Setup command execution failed: {str(e)}")
+            error_msg = f"Setup command failed: {str(e)}"
+            log_lines.append(error_msg)
+            raise Exception(error_msg)
     
     def terminate_container(self):
-        """Stop and remove the Docker container"""
         if not self.container_id:
             return
             
         try:
-            # Initialize Docker client
-            if os.name == 'nt':
-                client = docker.DockerClient(base_url='tcp://localhost:2375')
-            else:
-                client = docker.from_env()
-            
-            # Get and remove container
+            client = docker.from_env()
             container = client.containers.get(self.container_id)
             container.stop(timeout=5)
-            container.remove(v=True, force=True)  # Remove with volumes
-            logger.info(f"🗑️ Container terminated: {self.container_id}")
-            
-            # Clear container ID
+            container.remove(v=True, force=True)
+            logger.info(f"Container terminated: {self.container_id}")
             self.container_id = None
             self.save()
         except docker.errors.NotFound:
-            logger.warning(f"⚠️ Container not found during termination: {self.container_id}")
+            logger.warning(f"Container not found during termination: {self.container_id}")
         except Exception as e:
-            logger.error(f"🚫 Container termination failed: {str(e)}")
+            logger.error(f"Container termination failed: {str(e)}")
             raise Exception(f"Failed to clean up exam environment: {str(e)}")
     
     def execute_command(self, command):
-        """Execute a command in the container and return output"""
         if not self.container_id:
             return "No active container"
             
         try:
-            # Initialize Docker client
-            if os.name == 'nt':
-                client = docker.DockerClient(base_url='tcp://localhost:2375')
-            else:
-                client = docker.from_env()
-            
-            # Execute command
+            client = docker.from_env()
             container = client.containers.get(self.container_id)
             exit_code, output = container.exec_run(
                 command,
@@ -347,17 +353,11 @@ class PracticalExamSession(models.Model):
             return f"Command execution failed: {str(e)}"
     
     def get_container_status(self):
-        """Get current status of the Docker container"""
         if not self.container_id:
             return 'not created'
             
         try:
-            # Initialize Docker client
-            if os.name == 'nt':
-                client = docker.DockerClient(base_url='tcp://localhost:2375')
-            else:
-                client = docker.from_env()
-            
+            client = docker.from_env()
             container = client.containers.get(self.container_id)
             return container.status
         except docker.errors.NotFound:
@@ -366,21 +366,7 @@ class PracticalExamSession(models.Model):
             logger.error(f"Container status error: {str(e)}")
             return 'error'
     
-    def get_remaining_time(self):
-        """Calculate remaining exam time if time limit is set"""
-        if not self.exam.time_limit_minutes:
-            return None
-            
-        elapsed = timezone.now() - self.start_time
-        remaining = self.exam.time_limit_minutes * 60 - elapsed.total_seconds()
-        return max(0, remaining)
-    
-    def is_time_expired(self):
-        """Check if exam time has expired"""
-        return self.get_remaining_time() == 0
-    
     def save(self, *args, **kwargs):
-        """Auto-terminate container when session ends"""
         if self.status in ['completed', 'terminated'] and self.container_id:
             self.terminate_container()
         super().save(*args, **kwargs)
