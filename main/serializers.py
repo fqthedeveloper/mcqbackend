@@ -325,25 +325,34 @@ class ResultSerializer(serializers.ModelSerializer):
 
 
 class PracticalExamSerializer(serializers.ModelSerializer):
+    subject_name = serializers.CharField(source='subject.name', read_only=True)
+    
     class Meta:
         model = PracticalExam
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
 
+
 class PracticalExamSessionSerializer(serializers.ModelSerializer):
-    exam_title = serializers.CharField(source='exam.title', read_only=True)
-    subject_name = serializers.CharField(source='exam.subject.name', read_only=True)
-    
     class Meta:
         model = PracticalExamSession
         fields = '__all__'
-        read_only_fields = (
-            'container_id', 'start_time', 'end_time', 'status', 
-            'verification_output', 'is_success', 'termination_reason'
-        )
+        extra_kwargs = {
+            'student': {'required': False},
+            'token': {'read_only': True},
+            'container_id': {'read_only': True},
+            'start_time': {'read_only': True},
+            'end_time': {'read_only': True},
+            'status': {'read_only': True},
+            'verification_output': {'read_only': True},
+            'is_success': {'read_only': True},
+            'termination_reason': {'read_only': True},
+        }
 
 class PracticalExamResultSerializer(serializers.ModelSerializer):
     session_info = serializers.SerializerMethodField()
+    exam_title = serializers.CharField(source='session.exam.title', read_only=True)
+    student_name = serializers.CharField(source='session.student.username', read_only=True)
     
     class Meta:
         model = PracticalExamResult
@@ -351,7 +360,7 @@ class PracticalExamResultSerializer(serializers.ModelSerializer):
     
     def get_session_info(self, obj):
         return {
-            'exam_title': obj.session.exam.title,
             'start_time': obj.session.start_time,
-            'end_time': obj.session.end_time
+            'end_time': obj.session.end_time,
+            'duration': (obj.session.end_time - obj.session.start_time).total_seconds() if obj.session.end_time else None
         }

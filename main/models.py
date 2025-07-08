@@ -1,5 +1,6 @@
 from asyncio.log import logger
 import secrets
+import time
 from django.conf import settings
 from django.db import models
 from django.contrib.auth.models import AbstractUser
@@ -8,6 +9,7 @@ import os
 import shutil
 from django.utils import timezone
 import docker
+from requests import session
 
 
 
@@ -144,7 +146,7 @@ class Result(models.Model):
 
 
 class PracticalExam(models.Model):
-    subject = models.ForeignKey(Subject, on_delete=models.CASCADE)
+    subject = models.ForeignKey('Subject', on_delete=models.CASCADE)
     title = models.CharField(max_length=200)
     description = models.TextField()
     duration = models.PositiveIntegerField(help_text="Duration in minutes")
@@ -178,6 +180,7 @@ class PracticalExam(models.Model):
     def __str__(self):
         return self.title
 
+
 class PracticalExamSession(models.Model):
     STATUS_CHOICES = (
         ('running', 'Running'),
@@ -201,83 +204,193 @@ class PracticalExamSession(models.Model):
         ordering = ['-start_time']
         
     def __str__(self):
-        return f"{self.student.username} - {self.exam.title}"
+        return f"{self.student.username} - {self.exam.title} ({self.status})"
     
     def start_container(self):
-        client = docker.from_env()
-        environment = {
-            **self.exam.environment_vars,
-            "STUDENT_ID": str(self.student.id),
-            "EXAM_ID": str(self.exam.id)
-        }
-        
+        """Create and start a Docker container for the exam session"""
         try:
+            # Initialize Docker client based on OS
+            if os.name == 'nt':  # Windows
+                client = docker.DockerClient(base_url='tcp://localhost:2375', timeout=300)
+            else:  # Linux/Mac
+                client = docker.from_env(timeout=300)
+            
+            # Prepare environment variables
+            environment = {
+                **self.exam.environment_vars,
+                "STUDENT_ID": str(self.student.id),
+                "EXAM_ID": str(self.exam.id),
+                "TERM": "xterm-256color"  # For proper terminal emulation
+            }
+            
+            # Create volume path with OS-specific handling
+            volume_path = os.path.join(settings.BASE_DIR, 'exam_data', str(self.id))
+            os.makedirs(volume_path, exist_ok=True)
+            
+            # Convert Windows paths to Docker-compatible format
+            if os.name == 'nt':
+                volume_path = volume_path.replace('\\', '/').replace(':', '')
+                volume_path = f'/{volume_path}'
+            
+            # Create and start container
             container = client.containers.run(
                 image=self.exam.docker_image,
-                command="sleep infinity",
+                command="sleep infinity",  # Keep container running
                 detach=True,
                 tty=True,
                 environment=environment,
                 working_dir="/exam",
-                volumes={
-                    f"{settings.BASE_DIR}/exam_data/{self.id}": {
-                        'bind': '/exam', 
-                        'mode': 'rw'
-                    }
-                },
+                volumes={volume_path: {'bind': '/exam', 'mode': 'rw'}},
                 name=f"practical-exam-{self.id}",
                 stdin_open=True,
             )
+            
+            # Save container ID
             self.container_id = container.id
             self.save()
             
+            # Wait for container to start
+            self._wait_for_container(client, container)
+            
+            # Execute setup command if defined
             if self.exam.setup_command:
-                exit_code, output = container.exec_run(
-                    f"sh -c '{self.exam.setup_command}'",
-                    workdir="/exam",
-                    tty=True
-                )
-                logger.info(f"Setup command executed: {exit_code}")
+                self._execute_setup_command(client, container)
             
             return container
+        
         except docker.errors.ImageNotFound:
-            logger.error(f"Image not found: {self.exam.docker_image}")
-            raise Exception(f"Docker image {self.exam.docker_image} not found")
+            logger.error(f"🚫 Image not found: {self.exam.docker_image}")
+            raise Exception(f"Docker image '{self.exam.docker_image}' not available. Contact administrator.")
         except docker.errors.APIError as e:
-            logger.error(f"Docker API error: {str(e)}")
-            raise Exception(f"Docker error: {str(e)}")
+            logger.error(f"🚫 Docker API error: {str(e)}")
+            raise Exception(f"Docker service error: {str(e)}")
         except Exception as e:
-            logger.exception("Container start failed")
-            raise Exception(f"Failed to start container: {str(e)}")
+            logger.exception("🚫 Container startup failed")
+            raise Exception(f"Failed to start exam environment: {str(e)}")
+    
+    def _wait_for_container(self, client, container, max_retries=15, delay=1):
+        """Wait for container to reach running state"""
+        for _ in range(max_retries):
+            try:
+                container.reload()
+                if container.status == 'running':
+                    logger.info(f"✅ Container started: {container.id}")
+                    return
+                time.sleep(delay)
+            except docker.errors.NotFound:
+                raise Exception("Container disappeared during startup")
+        raise Exception("Timed out waiting for container to start")
+    
+    def _execute_setup_command(self, client, container):
+        """Execute the exam's setup command inside the container"""
+        try:
+            exit_code, output = container.exec_run(
+                cmd=self.exam.setup_command,
+                workdir="/exam",
+                tty=True
+            )
+            if exit_code != 0:
+                logger.warning(f"⚠️ Setup command exited with code {exit_code}")
+            else:
+                logger.info(f"✅ Setup command executed successfully")
+        except Exception as e:
+            logger.error(f"🚫 Setup command failed: {str(e)}")
+            raise Exception(f"Setup command execution failed: {str(e)}")
     
     def terminate_container(self):
-        client = docker.from_env()
+        """Stop and remove the Docker container"""
+        if not self.container_id:
+            return
+            
         try:
-            if self.container_id:
-                container = client.containers.get(self.container_id)
-                container.stop(timeout=2)
-                container.remove()
-                self.container_id = None
-                self.save()
+            # Initialize Docker client
+            if os.name == 'nt':
+                client = docker.DockerClient(base_url='tcp://localhost:2375')
+            else:
+                client = docker.from_env()
+            
+            # Get and remove container
+            container = client.containers.get(self.container_id)
+            container.stop(timeout=5)
+            container.remove(v=True, force=True)  # Remove with volumes
+            logger.info(f"🗑️ Container terminated: {self.container_id}")
+            
+            # Clear container ID
+            self.container_id = None
+            self.save()
+        except docker.errors.NotFound:
+            logger.warning(f"⚠️ Container not found during termination: {self.container_id}")
         except Exception as e:
-            logger.error(f"Error terminating container: {str(e)}")
+            logger.error(f"🚫 Container termination failed: {str(e)}")
+            raise Exception(f"Failed to clean up exam environment: {str(e)}")
     
     def execute_command(self, command):
-        client = docker.from_env()
+        """Execute a command in the container and return output"""
+        if not self.container_id:
+            return "No active container"
+            
         try:
+            # Initialize Docker client
+            if os.name == 'nt':
+                client = docker.DockerClient(base_url='tcp://localhost:2375')
+            else:
+                client = docker.from_env()
+            
+            # Execute command
             container = client.containers.get(self.container_id)
             exit_code, output = container.exec_run(
-                f"sh -c '{command}'",
+                command,
                 workdir="/exam"
             )
             return output.decode('utf-8')
         except Exception as e:
             return f"Command execution failed: {str(e)}"
+    
+    def get_container_status(self):
+        """Get current status of the Docker container"""
+        if not self.container_id:
+            return 'not created'
+            
+        try:
+            # Initialize Docker client
+            if os.name == 'nt':
+                client = docker.DockerClient(base_url='tcp://localhost:2375')
+            else:
+                client = docker.from_env()
+            
+            container = client.containers.get(self.container_id)
+            return container.status
+        except docker.errors.NotFound:
+            return 'not found'
+        except Exception as e:
+            logger.error(f"Container status error: {str(e)}")
+            return 'error'
+    
+    def get_remaining_time(self):
+        """Calculate remaining exam time if time limit is set"""
+        if not self.exam.time_limit_minutes:
+            return None
+            
+        elapsed = timezone.now() - self.start_time
+        remaining = self.exam.time_limit_minutes * 60 - elapsed.total_seconds()
+        return max(0, remaining)
+    
+    def is_time_expired(self):
+        """Check if exam time has expired"""
+        return self.get_remaining_time() == 0
+    
+    def save(self, *args, **kwargs):
+        """Auto-terminate container when session ends"""
+        if self.status in ['completed', 'terminated'] and self.container_id:
+            self.terminate_container()
+        super().save(*args, **kwargs)
 
+
+        
 class PracticalExamResult(models.Model):
     session = models.ForeignKey(PracticalExamSession, on_delete=models.CASCADE)
-    score = models.PositiveIntegerField()
-    total_possible = models.PositiveIntegerField()
+    score = models.FloatField()
+    total_possible = models.FloatField()
     details = models.JSONField()
     created_at = models.DateTimeField(auto_now_add=True)
 

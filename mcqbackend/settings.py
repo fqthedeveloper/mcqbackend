@@ -169,10 +169,10 @@ SIMPLE_JWT = {
 
 
 CHANNEL_LAYERS = {
-    'default': {
-        'BACKEND': 'channels_redis.core.RedisChannelLayer',
-        'CONFIG': {
-            "hosts": [('redis', 6379)],
-        },
+    "default": {
+        "BACKEND": "channels.layers.InMemoryChannelLayer",  # Use Redis in production
     },
 }
+
+# Docker socket access
+DOCKER_BASE_URL = "unix://var/run/docker.sock"

@@ -1,5 +1,7 @@
-from django.urls import path, include
+from django.urls import path, include, re_path
 from rest_framework import routers
+
+from main import consumers
 from .views import (
     UserViewSet,
     SubjectViewSet,
@@ -40,6 +42,9 @@ urlpatterns = [
     path('sessions/<int:pk>/start/', ExamSessionViewSet.as_view({'post': 'start_exam'}), name='session-start'),
     path('sessions/<int:pk>/submit/', ExamSessionViewSet.as_view({'post': 'submit_exam'}), name='session-submit'),
     path('sessions/validate-exam/<int:pk>', ExamSessionViewSet.as_view({'post': 'validate_exam'}), name='validate-exam'),
+
+    path('practical-sessions/<int:pk>/container_status/', PracticalExamSessionViewSet.as_view({'post': 'container_status'}), name='container-status'),
+
     path('send-otp/', SendOTPView.as_view(), name='send_otp'),
     path('verify-otp/', VerifyOTPView.as_view(), name='verify_otp'),
 ]
