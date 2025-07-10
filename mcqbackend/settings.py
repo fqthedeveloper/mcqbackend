@@ -175,4 +175,4 @@ CHANNEL_LAYERS = {
 }
 
 # Docker socket access
-DOCKER_BASE_URL = "unix://var/run/docker.sock"
+#DOCKER_BASE_URL = "unix://var/run/docker.sock"

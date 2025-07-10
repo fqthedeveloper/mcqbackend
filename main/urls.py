@@ -42,6 +42,7 @@ urlpatterns = [
     path('sessions/validate-exam/<int:pk>', ExamSessionViewSet.as_view({'post': 'validate_exam'}), name='validate-exam'),
 
     path('practical-sessions/<int:pk>/container_status/', PracticalExamSessionViewSet.as_view({'post': 'container_status'}), name='container-status'),
+    path('practical-sessions/<int:pk>/reset_container/', PracticalExamSessionViewSet.as_view({'post': 'container_reset'}), name='container-reset'),
 
     path('send-otp/', SendOTPView.as_view(), name='send_otp'),
     path('verify-otp/', VerifyOTPView.as_view(), name='verify_otp'),

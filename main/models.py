@@ -177,6 +177,9 @@ class PracticalExam(models.Model):
 
     def __str__(self):
         return self.title
+    
+
+    
 class PracticalExamSession(models.Model):
     STATUS_CHOICES = (
         ('starting', 'Starting'),  # New status

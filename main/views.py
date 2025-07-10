@@ -692,9 +692,9 @@ class PracticalExamViewSet(viewsets.ModelViewSet):
         if user.user_type == 'student':
             return PracticalExam.objects.filter(is_published=True)
         return PracticalExam.objects.all()
-
-
 class PracticalExamSessionViewSet(viewsets.ModelViewSet):
+    """ViewSet for managing practical exam sessions and container lifecycle."""
+    queryset = PracticalExamSession.objects.all()
     serializer_class = PracticalExamSessionSerializer
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
@@ -707,7 +707,7 @@ class PracticalExamSessionViewSet(viewsets.ModelViewSet):
     def token(self, request, pk=None):
         session = self.get_object()
         return Response({'token': session.token})
-    
+
     @action(detail=True, methods=['get'])
     def container_status(self, request, pk=None):
         session = self.get_object()
@@ -715,166 +715,130 @@ class PracticalExamSessionViewSet(viewsets.ModelViewSet):
             'status': session.get_container_status(),
             'container_id': session.container_id
         })
-    
-    @action(detail=True, methods=['post'])
+
+    @action(detail=True, methods=['post'], url_path='reset_container')
     def restart_container(self, request, pk=None):
+        """Stops and removes existing container, resets session state, and starts a new container."""
         session = self.get_object()
         try:
-            # Force remove existing container if any
+            # Remove existing container if present
             if session.container_id:
                 try:
                     client = docker.from_env()
-                    try:
-                        container = client.containers.get(session.container_id)
-                        container.stop(timeout=1)
-                        container.remove(force=True)
-                    except docker.errors.NotFound:
-                        pass
-                except Exception as e:
-                    logger.error(f"Container removal error: {str(e)}")
-            
-            # Reset session container info
+                    container = client.containers.get(session.container_id)
+                    container.stop(timeout=1)
+                    container.remove(force=True)
+                except docker.errors.NotFound:
+                    pass
+            # Reset session
             session.container_id = None
             session.verification_output = None
             session.is_success = False
             session.termination_reason = None
             session.status = 'running'
             session.save()
-            
-            # Start new container in background thread
-            threading.Thread(target=session.start_container).start()
-            
-            return Response({
-                'status': 'restarting',
-                'message': 'Container is being restarted'
-            })
+            # Start new container in background
+            threading.Thread(target=session.start_container, daemon=True).start()
+            return Response({'status': 'restarting', 'message': 'Container is being restarted'})
         except Exception as e:
             logger.exception("Container restart failed")
-            return Response({
-                'error': 'Container restart failed',
-                'details': str(e)
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({'error': 'Container restart failed', 'details': str(e)},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=True, methods=['post'])
+    def submit(self, request, pk=None):
+        """Marks session complete and terminates container."""
+        session = self.get_object()
+        user = request.user
+        if session.student != user:
+            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+        if session.status != 'running':
+            return Response({'error': 'Session not active', 'current_status': session.status},
+                            status=status.HTTP_400_BAD_REQUEST)
+        try:
+            # End session
+            session.status = 'completed'
+            session.end_time = timezone.now()
+            session.save()
+            # Terminate container
+            session.terminate_container()
+            return Response({'status': 'completed', 'session_id': session.id})
+        except Exception as e:
+            logger.exception("Submit failed")
+            return Response({'error': 'Submit failed', 'details': str(e)},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     def create(self, request, *args, **kwargs):
+        """Creates or returns existing running session for exam."""
         user = request.user
         exam_id = request.data.get('exam')
-        
         if not exam_id:
             return Response({'error': 'Exam ID required'}, status=status.HTTP_400_BAD_REQUEST)
-        
         try:
-            # Check for existing session
-            existing_session = PracticalExamSession.objects.filter(
-                student=user, 
-                exam_id=exam_id,
-                status='running'
-            ).first()
-            
-            if existing_session:
-                return Response(
-                    PracticalExamSessionSerializer(existing_session).data,
-                    status=status.HTTP_200_OK
-                )
-            
-            # Create new session
-            session = PracticalExamSession.objects.create(
-                student=user,
-                exam_id=exam_id,
-                status='starting'  # New initial status
-            )
-            
-            # Start container in background thread
-            threading.Thread(target=session.start_container).start()
-            
-            return Response(
-                PracticalExamSessionSerializer(session).data, 
-                status=status.HTTP_201_CREATED
-            )
+            existing = PracticalExamSession.objects.filter(student=user, exam_id=exam_id, status='running').first()
+            if existing:
+                data = PracticalExamSessionSerializer(existing).data
+                return Response(data, status=status.HTTP_200_OK)
+            session = PracticalExamSession.objects.create(student=user, exam_id=exam_id, status='starting')
+            threading.Thread(target=session.start_container, daemon=True).start()
+            return Response(PracticalExamSessionSerializer(session).data, status=status.HTTP_201_CREATED)
         except Exception as e:
             logger.exception("Session creation failed")
-            return Response({
-                'error': 'Session creation failed',
-                'details': str(e)
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({'error': 'Session creation failed', 'details': str(e)},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'])
     def verify(self, request, pk=None):
         session = self.get_object()
         user = request.user
-        
         if session.student != user:
             return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
-        
         if session.status != 'running':
-            return Response({
-                'error': 'Session not active',
-                'current_status': session.status
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
+            return Response({'error': 'Session not active', 'current_status': session.status},
+                            status=status.HTTP_400_BAD_REQUEST)
         try:
             output = session.execute_command(session.exam.verification_command)
-            success = "success" in output.lower() or "ok" in output.lower()
-            
+            success = 'success' in output.lower() or 'ok' in output.lower()
             session.status = 'completed'
             session.end_time = timezone.now()
             session.verification_output = output[:10000]
             session.is_success = success
             session.save()
-            
             session.terminate_container()
-            
-            return Response({
-                'is_success': success,
-                'verification_output': output[:5000]
-            })
+            return Response({'is_success': success, 'verification_output': output[:5000]})
         except Exception as e:
             logger.exception("Verification failed")
-            return Response({
-                'error': 'Verification failed',
-                'details': str(e)
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({'error': 'Verification failed', 'details': str(e)},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'])
     def terminate(self, request, pk=None):
         session = self.get_object()
         user = request.user
-        
         if session.student != user:
             return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
-        
         if session.status != 'running':
-            return Response({
-                'error': 'Session not active',
-                'current_status': session.status
-            }, status=status.HTTP_400_BAD_REQUEST)
-        
+            return Response({'error': 'Session not active', 'current_status': session.status},
+                            status=status.HTTP_400_BAD_REQUEST)
         reason = request.data.get('reason', 'Terminated by student')[:200]
-        
         try:
             session.terminate_container()
             session.status = 'terminated'
             session.end_time = timezone.now()
             session.termination_reason = reason
             session.save()
-            
-            return Response({
-                'status': 'terminated',
-                'session_id': session.id,
-                'termination_reason': reason
-            })
+            return Response({'status': 'terminated', 'session_id': session.id, 'termination_reason': reason})
         except Exception as e:
             logger.exception("Termination failed")
-            return Response({
-                'error': 'Termination failed',
-                'details': str(e)
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-    
+            return Response({'error': 'Termination failed', 'details': str(e)},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
     def destroy(self, request, *args, **kwargs):
         session = self.get_object()
         if session.status == 'running':
             session.terminate_container()
         return super().destroy(request, *args, **kwargs)
-    
+
 
 
 class PracticalExamResultViewSet(viewsets.ReadOnlyModelViewSet):
