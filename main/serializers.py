@@ -1,21 +1,28 @@
-from django.conf import settings
-from django.db import IntegrityError
 from rest_framework import serializers
 from .models import *
-from django.contrib.auth import authenticate
 from django.contrib.auth import get_user_model
 import logging
 from django.contrib.auth.password_validation import validate_password
 from django.core.mail import send_mail
-from django.utils.crypto import get_random_string
-from rest_framework import status
+from django.conf import settings
+import logging
+import secrets
+import string
+from django.db import IntegrityError, models
+from django.conf import settings
+from rest_framework import serializers
+from rest_framework.decorators import action
+from rest_framework import viewsets, status
 from rest_framework.response import Response
+from rest_framework.authentication import TokenAuthentication
+from rest_framework.permissions import IsAuthenticated
+from .models import Subject
+from .permissions import IsAdminUserOnly
 
 
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
-
 
 class UserSerializer(serializers.ModelSerializer):
     last_login = serializers.DateTimeField(format='%Y-%m-%d %H:%M:%S', read_only=True)
@@ -24,7 +31,7 @@ class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = ['id', 'email', 'username', 'user_type', 'is_verified',
-                  'last_login', 'date_joined', 'is_active']
+                  'last_login', 'date_joined', 'is_active', 'subjects']
 
 class LoginSerializer(serializers.Serializer):
     username_or_email = serializers.CharField()
@@ -84,43 +91,220 @@ class LoginSerializer(serializers.Serializer):
         return data
 
 
-class StudentCreateSerializer(serializers.ModelSerializer):
-    first_name = serializers.CharField(required=True)
-    last_name = serializers.CharField(required=True)
+class SubjectSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Subject
+        fields = ['id', 'name']
+
+
+class AddSubjectSerializer(serializers.Serializer):
+    subject_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        required=True
+    )
+
+    def validate_subject_ids(self, value):
+        if not value:
+            raise serializers.ValidationError("At least one subject must be selected")
+        return value
+
+
+class StudentSubjectSerializer(serializers.ModelSerializer):
+    subjects = SubjectSerializer(many=True, read_only=True)
 
     class Meta:
         model = User
-        fields = ['id', 'email', 'username', 'first_name', 'last_name', 'is_verified', 'force_password_change']
+        fields = ['id', 'email', 'username', 'first_name', 'last_name', 'subjects']
+
+
+class StudentCreateSerializer(serializers.ModelSerializer):
+    subjects = SubjectSerializer(many=True, required=False, read_only=True)
+    subject_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        write_only=True,
+        required=False
+    )
+    password = serializers.CharField(write_only=True, required=False)
+
+    class Meta:
+        model = User
+        fields = ['id', 'email', 'username', 'first_name', 'last_name', 'password', 'subjects', 'subject_ids', 'is_verified', 'is_active']
+        extra_kwargs = {
+            'user_type': {'read_only': True}
+        }
+
+    def generate_random_password(self, length=12):
+        """Generate a secure random password"""
+        alphabet = string.ascii_letters + string.digits + string.punctuation
+        return ''.join(secrets.choice(alphabet) for i in range(length))
+
+    def send_credentials_email(self, user, password, subject="IRT Exam Portal Account Credentials"):
+        """Helper method to send credentials email"""
+        try:
+            send_mail(
+                subject=subject,
+                message=f'''
+                Hello {user.first_name},
+                
+                Your student account has been created/updated.
+                
+                Username: {user.username}
+                Password: {password}
+                
+                Please change your password after first login.
+                
+                Best regards,
+                IRT Technalogeis 
+                ''',
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[user.email],
+                fail_silently=False,
+            )
+            logger.info(f"Credentials email sent to {user.email}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send email to {user.email}: {str(e)}")
+            return False
 
     def create(self, validated_data):
-        password = get_random_string(length=10)
-        try:
-            user = User.objects.create_user(
-                email=validated_data['email'],
-                username=validated_data.get('username', validated_data['email']),
-                user_type='student',
-                password=password,
-                force_password_change=True,
-                first_name=validated_data['first_name'],
-                last_name=validated_data['last_name'],
-            )
-        except IntegrityError as e:
-            # This handles database unique constraints like duplicate email or username
-            raise serializers.ValidationError({"detail": "A user with this email or username already exists."})
-
-        send_mail(
-            subject='Your IRT MCQ Webapp Student Account Login',
-            message=(
-                f'Your IRT MCQ Webapp account has been created.\n\n'
-                f'Email: {user.email}\n'
-                f'Password: {password}\n\n'
-                'Please change your password after first login.'
-            ),
-            from_email=settings.EMAIL_HOST_USER,
-            recipient_list=[user.email],
-            fail_silently=False,
+        subject_ids = validated_data.pop('subject_ids', [])
+        password = validated_data.pop('password', None)
+        
+        if password is None:
+            password = self.generate_random_password()
+            
+        # Create user with the custom manager
+        user = User.objects.create_user(
+            email=validated_data['email'],
+            username=validated_data.get('username', validated_data['email']),
+            password=password,
+            first_name=validated_data.get('first_name', ''),
+            last_name=validated_data.get('last_name', ''),
+            user_type='student',
+            is_verified=validated_data.get('is_verified', False),
+            is_active=validated_data.get('is_active', True)
         )
+        
+        # Add subjects to student
+        if subject_ids:
+            subjects = Subject.objects.filter(id__in=subject_ids)
+            user.subjects.set(subjects)
+            
+        # Send email with credentials
+        self.send_credentials_email(user, password)
+        
         return user
+
+    def update(self, instance, validated_data):
+        subject_ids = validated_data.pop('subject_ids', None)
+        password = validated_data.pop('password', None)
+        email_changed = 'email' in validated_data and instance.email != validated_data['email']
+        
+        # Update other fields
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+            
+        if password:
+            instance.set_password(password)
+            
+        instance.save()
+        
+        # Update subjects if provided
+        if subject_ids is not None:
+            subjects = Subject.objects.filter(id__in=subject_ids)
+            instance.subjects.set(subjects)
+            
+        # Send email if password was changed or email was updated
+        if password:
+            self.send_credentials_email(instance, password, "Your Password Has Been Updated")
+        elif email_changed:
+            try:
+                send_mail(
+                    subject='Your email has been updated',
+                    message=(
+                        f'Hello {instance.first_name},\n\n'
+                        f'Your email address has been changed to {instance.email}.\n'
+                        'If you did not request this change, please contact support immediately.'
+                    ),
+                    from_email=settings.DEFAULT_FROM_EMAIL,
+                    recipient_list=[instance.email],
+                    fail_silently=False,
+                )
+                logger.info(f"Email change notification sent to {instance.email}")
+            except Exception as e:
+                logger.error(f"Failed to send email change notification to {instance.email}: {str(e)}")
+            
+        return instance
+
+
+class StudentViewSet(viewsets.ModelViewSet):
+    queryset = User.objects.filter(user_type='student')
+    serializer_class = StudentCreateSerializer
+    permission_classes = [IsAuthenticated, IsAdminUserOnly]
+    authentication_classes = [TokenAuthentication]
+
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            self.perform_create(serializer)
+        except IntegrityError:
+            return Response(
+                {"detail": "A user with this email or username already exists."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+
+        return Response(serializer.data, status=status.HTTP_200_OK)
+    
+    @action(detail=True, methods=['POST'])
+    def add_subjects(self, request, pk=None):
+        student = self.get_object()
+        serializer = AddSubjectSerializer(data=request.data)
+        
+        if serializer.is_valid():
+            subject_ids = serializer.validated_data['subject_ids']
+            subjects = Subject.objects.filter(id__in=subject_ids)
+            student.subjects.add(*subjects)
+            
+            return Response(
+                {"detail": "Subjects added successfully."},
+                status=status.HTTP_200_OK
+            )
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    @action(detail=True, methods=['POST'])
+    def remove_subjects(self, request, pk=None):
+        student = self.get_object()
+        serializer = AddSubjectSerializer(data=request.data)
+        
+        if serializer.is_valid():
+            subject_ids = serializer.validated_data['subject_ids']
+            subjects = Subject.objects.filter(id__in=subject_ids)
+            student.subjects.remove(*subjects)
+            
+            return Response(
+                {"detail": "Subjects removed successfully."},
+                status=status.HTTP_200_OK
+            )
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
 
 class PasswordChangeSerializer(serializers.Serializer):
     new_password = serializers.CharField(
@@ -134,12 +318,8 @@ class PasswordChangeSerializer(serializers.Serializer):
         return data
 
 
-class SubjectSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Subject
-        fields = ['id', 'name']
 
-
+        
 class QuestionSerializer(serializers.ModelSerializer):
     options = serializers.SerializerMethodField()
     subject = serializers.StringRelatedField(read_only=True)
@@ -213,7 +393,6 @@ class QuestionSerializer(serializers.ModelSerializer):
     class Meta:
         model = Question
         fields = '__all__'
-
 
 class ExamQuestionSerializer(serializers.ModelSerializer):
     question = QuestionSerializer(read_only=True)
@@ -298,15 +477,15 @@ class ExamSerializer(serializers.ModelSerializer):
             except Question.DoesNotExist:
                 continue
 
-
 class ExamSessionSerializer(serializers.ModelSerializer):
+    exam = ExamSerializer(read_only=True)  
     exam_title = serializers.CharField(source='exam.title', read_only=True)
     student_name = serializers.CharField(source='student.get_full_name', read_only=True)
 
     class Meta:
         model = ExamSession
         fields = '__all__'
-        read_only_fields = ['start_time', 'end_time', 'is_completed', 'termination_reason']
+        depth = 1
 
 class AnswerSerializer(serializers.ModelSerializer):
     class Meta:
@@ -324,6 +503,7 @@ class ResultSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 
+
 class PracticalExamSerializer(serializers.ModelSerializer):
     subject_name = serializers.CharField(source='subject.name', read_only=True)    
     
@@ -332,7 +512,6 @@ class PracticalExamSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
 
-
 class PracticalExamSessionSerializer(serializers.ModelSerializer):
     class Meta:
         model = PracticalExamSession
@@ -340,15 +519,15 @@ class PracticalExamSessionSerializer(serializers.ModelSerializer):
         extra_kwargs = {
             'student': {'required': False},
             'token': {'read_only': True},
-            'container_id': {'read_only': True},
+            'vm_name': {'read_only': True},
             'start_time': {'read_only': True},
             'end_time': {'read_only': True},
             'status': {'read_only': True},
             'verification_output': {'read_only': True},
             'is_success': {'read_only': True},
             'termination_reason': {'read_only': True},
+            'ssh_port': {'read_only': True},
         }
-
 
 class PracticalExamResultSerializer(serializers.ModelSerializer):
     session_info = serializers.SerializerMethodField()
@@ -365,3 +544,43 @@ class PracticalExamResultSerializer(serializers.ModelSerializer):
             'end_time': obj.session.end_time,
             'duration': (obj.session.end_time - obj.session.start_time).total_seconds() if obj.session.end_time else None
         }
+    
+
+class StudentExamSerializer(serializers.ModelSerializer):
+    subject_name = serializers.CharField(source='subject.name', read_only=True)
+    can_take = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Exam
+        fields = ['id', 'title', 'subject', 'subject_name', 'mode', 'duration', 
+                 'start_time', 'end_time', 'is_published', 'question_count', 'can_take']
+
+    def get_can_take(self, obj):
+        request = self.context.get('request')
+        if request and request.user.is_authenticated:
+            # Check if student has this subject
+            if obj.subject not in request.user.subjects.all():
+                return False
+            
+            # Check if exam is published and within time range
+            if not obj.is_published:
+                return False
+                
+            now = timezone.now()
+            if obj.start_time and now < obj.start_time:
+                return False
+            if obj.end_time and now > obj.end_time:
+                return False
+                
+            # Check if already completed (for strict mode)
+            if obj.mode == 'strict':
+                completed = ExamSession.objects.filter(
+                    student=request.user, 
+                    exam=obj, 
+                    is_completed=True
+                ).exists()
+                if completed:
+                    return False
+                    
+            return True
+        return False

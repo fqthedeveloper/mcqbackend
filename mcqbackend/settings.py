@@ -145,7 +145,7 @@ EMAIL_HOST = 'smtp.gmail.com'  # or your SMTP server
 EMAIL_PORT = 587
 EMAIL_USE_TLS = True
 EMAIL_HOST_USER = 'fqthedeveloper@gmail.com'
-EMAIL_HOST_PASSWORD = 'xqpy cfeb ryod fdkz'  # use an app-specific password
+EMAIL_HOST_PASSWORD = 'hjoc oawq aalp lgsm'  # use an app-specific password
 
 
 REST_FRAMEWORK = {
@@ -176,3 +176,6 @@ CHANNEL_LAYERS = {
 
 # Docker socket access
 #DOCKER_BASE_URL = "unix://var/run/docker.sock"
+
+VM_SSH_USERNAME = "root"
+VM_SSH_PASSWORD = "redhat" 

@@ -1,15 +1,31 @@
 from asyncio.log import logger
+from django.contrib.auth.models import AbstractUser, BaseUserManager
+from django.db import models
+from django.utils import timezone
+from django.conf import settings
 import secrets
 import time
-from django.conf import settings
-from django.db import models
-from django.contrib.auth.models import AbstractUser
-from django.utils import timezone
-import os
-from django.utils import timezone
-import docker
+import secrets
+import subprocess
+import time
+from django.core.exceptions import ValidationError
 
 
+
+class UserManager(BaseUserManager):
+    def create_user(self, email, password=None, **extra_fields):
+        if not email:
+            raise ValueError('The Email field must be set')
+        email = self.normalize_email(email)
+        user = self.model(email=email, **extra_fields)
+        user.set_password(password)
+        user.save(using=self._db)
+        return user
+
+    def create_superuser(self, email, password=None, **extra_fields):
+        extra_fields.setdefault('is_staff', True)
+        extra_fields.setdefault('is_superuser', True)
+        return self.create_user(email, password, **extra_fields)
 
 class User(AbstractUser):
     USER_TYPES = (
@@ -21,9 +37,12 @@ class User(AbstractUser):
     force_password_change = models.BooleanField(default=True)
     email = models.EmailField(unique=True)
     username = models.CharField(max_length=150, blank=True)
+    subjects = models.ManyToManyField('Subject', related_name='students', blank=True)
 
     USERNAME_FIELD = 'email'
     REQUIRED_FIELDS = ['username']
+
+    objects = UserManager()
 
     def __str__(self):
         return self.email
@@ -40,6 +59,8 @@ class User(AbstractUser):
         blank=True,
     )
 
+
+
 class EmailOTP(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE)
     otp = models.CharField(max_length=6)
@@ -48,6 +69,7 @@ class EmailOTP(models.Model):
 
 class Subject(models.Model):
     name = models.CharField(max_length=100)
+    
     def __str__(self):
         return self.name
 
@@ -143,15 +165,21 @@ class Result(models.Model):
         return f"Result: {self.session.id} - {self.score}/{self.total_marks}"
 
 
+
 class PracticalExam(models.Model):
     subject = models.ForeignKey('Subject', on_delete=models.CASCADE)
     title = models.CharField(max_length=200)
     description = models.TextField()
     duration = models.PositiveIntegerField(help_text="Duration in minutes")
-    docker_image = models.CharField(
+    vm_base_name = models.CharField(
         max_length=255,
-        default="redhat/ubi8:latest",
-        help_text="Docker image to use for the exam"
+        default="Redhat",
+        help_text="Base VM name to clone from"
+    )
+    vm_snapshot = models.CharField(
+        max_length=255,
+        default="base_snapshot",
+        help_text="Snapshot to use for cloning"
     )
     setup_command = models.TextField(
         help_text="Command to run when session starts",
@@ -171,35 +199,44 @@ class PracticalExam(models.Model):
         blank=True,
         help_text="List of allowed commands (empty for all)"
     )
+    vm_username = models.CharField(
+        max_length=100,
+        default="examuser",
+        help_text="Username to access the VM"
+    )
+    vm_password = models.CharField(
+        max_length=100,
+        default="exampass",
+        help_text="Password to access the VM"
+    )
     is_published = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
         return self.title
-    
 
-    
 class PracticalExamSession(models.Model):
     STATUS_CHOICES = (
-        ('starting', 'Starting'),  # New status
+        ('starting', 'Starting'),
         ('running', 'Running'),
         ('completed', 'Completed'),
         ('terminated', 'Terminated'),
-        ('failed', 'Failed'),  # New status for startup failures
+        ('failed', 'Failed'),
     )
     
     student = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     exam = models.ForeignKey('PracticalExam', on_delete=models.CASCADE)
-    container_id = models.CharField(max_length=64, null=True, blank=True)
+    vm_name = models.CharField(max_length=255, null=True, blank=True)
     start_time = models.DateTimeField(auto_now_add=True)
     end_time = models.DateTimeField(null=True, blank=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='starting')  # Updated default
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='starting')
     verification_output = models.TextField(blank=True, null=True)
     is_success = models.BooleanField(default=False)
     termination_reason = models.TextField(null=True, blank=True)
     token = models.CharField(max_length=100, default=secrets.token_urlsafe, unique=True)
-    startup_log = models.TextField(blank=True, null=True)  # Store startup logs
+    startup_log = models.TextField(blank=True, null=True)
+    ssh_port = models.IntegerField(null=True, blank=True, help_text="SSH port for VM access")
 
     class Meta:
         unique_together = [('student', 'exam')]
@@ -208,174 +245,119 @@ class PracticalExamSession(models.Model):
     def __str__(self):
         return f"{self.student.username} - {self.exam.title} ({self.status})"
     
-    def start_container(self):
-        """Create and start a Docker container for the exam session"""
+    def start_vm(self):
+        """Create and start a VirtualBox VM for the exam session"""
+        from .vbox_settings import vbox_manager
         log_lines = []
         
         try:
-            client = docker.from_env(timeout=300)
-            log_lines.append(f"Docker client initialized")
+            # Generate unique VM name
+            self.vm_name = f"exam-{self.exam.id}-{self.student.id}-{secrets.token_hex(4)}"
+            log_lines.append(f"Generated VM name: {self.vm_name}")
             
-            environment = {
-                **self.exam.environment_vars,
-                "STUDENT_ID": str(self.student.id),
-                "EXAM_ID": str(self.exam.id),
-                "TERM": "xterm-256color"
-            }
+            # Clone the base VM
+            log_lines.append(f"Cloning VM from {self.exam.vm_base_name} with snapshot {self.exam.vm_snapshot}")
+            if not vbox_manager.clone_vm(self.vm_name, self.exam.vm_snapshot):
+                raise Exception("Failed to clone VM")
             
-            volume_path = os.path.join(settings.BASE_DIR, 'exam_data', str(self.id))
-            os.makedirs(volume_path, exist_ok=True)
-            log_lines.append(f"Created volume path: {volume_path}")
+            # Configure network
+            log_lines.append("Configuring NAT network")
+            if not vbox_manager.set_network_nat(self.vm_name):
+                raise Exception("Failed to configure network")
             
-            if os.name == 'nt':
-                volume_path = volume_path.replace('\\', '/').replace(':', '')
-                volume_path = f'/{volume_path}'
-                log_lines.append(f"Converted Windows path: {volume_path}")
+            # Start the VM
+            log_lines.append("Starting VM")
+            if not vbox_manager.start_vm(self.vm_name, headless=True):
+                raise Exception("Failed to start VM")
             
-            # Run container
-            container = client.containers.run(
-                image=self.exam.docker_image,
-                command="sleep infinity",
-                detach=True,
-                tty=True,
-                environment=environment,
-                working_dir="/exam",
-                volumes={volume_path: {'bind': '/exam', 'mode': 'rw'}},
-                name=f"practical-exam-{self.id}",
-                stdin_open=True,
-            )
-            log_lines.append(f"Container created: {container.id}")
-            
-            self.container_id = container.id
-            self.status = 'running'
-            self.save()
-            log_lines.append("Container ID saved to session")
-            
-            # Wait for container to be fully started
-            self._wait_for_container(client, container, log_lines)
+            # Wait for VM to boot
+            log_lines.append("Waiting for VM to boot")
+            vbox_manager.wait_for_vm_boot(self.vm_name)
+            log_lines.append("VM is ready")
             
             # Execute setup command if defined
             if self.exam.setup_command:
                 log_lines.append(f"Executing setup command: {self.exam.setup_command}")
-                self._execute_setup_command(client, container, log_lines)
+                output = vbox_manager.execute_command_in_vm(
+                    self.vm_name, 
+                    self.exam.setup_command,
+                    self.exam.vm_username,
+                    self.exam.vm_password
+                )
+                log_lines.append(f"Setup command output: {output}")
                 
-            log_lines.append("Container started successfully")
+            # Update session status
+            self.status = 'running'
+            self.save()
+            log_lines.append("VM started successfully")
             
-        except docker.errors.ImageNotFound:
-            error_msg = f"Image not found: {self.exam.docker_image}"
-            log_lines.append(error_msg)
-            self.status = 'failed'
-            self.termination_reason = error_msg
-            logger.error(error_msg)
-        except docker.errors.APIError as e:
-            error_msg = f"Docker API error: {str(e)}"
-            log_lines.append(error_msg)
-            self.status = 'failed'
-            self.termination_reason = error_msg
-            logger.error(error_msg)
         except Exception as e:
-            error_msg = f"Container startup failed: {str(e)}"
+            error_msg = f"VM startup failed: {str(e)}"
             log_lines.append(error_msg)
             self.status = 'failed'
             self.termination_reason = error_msg
-            logger.exception("Container startup failed")
+            logger.error(error_msg)
+            
+            # Clean up on failure
+            if self.vm_name:
+                try:
+                    vbox_manager.delete_vm(self.vm_name)
+                except:
+                    pass
         finally:
             self.startup_log = "\n".join(log_lines)
             self.save()
     
-    def _wait_for_container(self, client, container, log_lines, max_retries=20, delay=2):
-        """Wait for container to reach running state"""
-        for i in range(max_retries):
-            try:
-                container.reload()
-                if container.status == 'running':
-                    log_lines.append(f"Container running after {i+1} checks")
-                    return
-                log_lines.append(f"Container status: {container.status} (check {i+1})")
-            except docker.errors.NotFound:
-                log_lines.append(f"Container not found during check {i+1}")
-            except Exception as e:
-                log_lines.append(f"Error checking container: {str(e)}")
-                
-            time.sleep(delay)
-        
-        error_msg = f"Timed out waiting for container to start after {max_retries*delay} seconds"
-        log_lines.append(error_msg)
-        raise Exception(error_msg)
-    
-    def _execute_setup_command(self, client, container, log_lines):
-        """Execute setup command in container"""
-        try:
-            exit_code, output = container.exec_run(
-                cmd=self.exam.setup_command,
-                workdir="/exam",
-                tty=True
-            )
-            output = output.decode('utf-8') if isinstance(output, bytes) else output
-            log_lines.append(f"Setup command executed. Exit code: {exit_code}")
-            log_lines.append(f"Command output:\n{output[:1000]}")
-            
-            if exit_code != 0:
-                log_lines.append(f"Warning: Setup command exited with code {exit_code}")
-        except Exception as e:
-            error_msg = f"Setup command failed: {str(e)}"
-            log_lines.append(error_msg)
-            raise Exception(error_msg)
-    
-    def terminate_container(self):
-        if not self.container_id:
+    def terminate_vm(self):
+        """Terminate and delete the VM"""
+        if not self.vm_name:
             return
             
         try:
-            client = docker.from_env()
-            container = client.containers.get(self.container_id)
-            container.stop(timeout=5)
-            container.remove(v=True, force=True)
-            logger.info(f"Container terminated: {self.container_id}")
-            self.container_id = None
+            from .vbox_settings import vbox_manager
+            vbox_manager.delete_vm(self.vm_name)
+            self.vm_name = None
             self.save()
-        except docker.errors.NotFound:
-            logger.warning(f"Container not found during termination: {self.container_id}")
+            logger.info(f"VM terminated: {self.vm_name}")
         except Exception as e:
-            logger.error(f"Container termination failed: {str(e)}")
+            logger.error(f"VM termination failed: {str(e)}")
             raise Exception(f"Failed to clean up exam environment: {str(e)}")
     
     def execute_command(self, command):
-        if not self.container_id:
-            return "No active container"
+        """Execute a command in the VM"""
+        if not self.vm_name:
+            return "No active VM"
             
         try:
-            client = docker.from_env()
-            container = client.containers.get(self.container_id)
-            exit_code, output = container.exec_run(
+            from .vbox_settings import vbox_manager
+            output = vbox_manager.execute_command_in_vm(
+                self.vm_name, 
                 command,
-                workdir="/exam"
+                self.exam.vm_username,
+                self.exam.vm_password
             )
-            return output.decode('utf-8')
+            return output
         except Exception as e:
             return f"Command execution failed: {str(e)}"
     
-    def get_container_status(self):
-        if not self.container_id:
+    def get_vm_status(self):
+        """Get the status of the VM"""
+        if not self.vm_name:
             return 'not created'
             
         try:
-            client = docker.from_env()
-            container = client.containers.get(self.container_id)
-            return container.status
-        except docker.errors.NotFound:
-            return 'not found'
+            from .vbox_settings import vbox_manager
+            info = vbox_manager.get_vm_info(self.vm_name)
+            return info.get('VMState', 'unknown')
         except Exception as e:
-            logger.error(f"Container status error: {str(e)}")
+            logger.error(f"VM status error: {str(e)}")
             return 'error'
-    
+
     def save(self, *args, **kwargs):
-        if self.status in ['completed', 'terminated'] and self.container_id:
-            self.terminate_container()
+        if self.status in ['completed', 'terminated'] and self.vm_name:
+            self.terminate_vm()
         super().save(*args, **kwargs)
 
-
-        
 class PracticalExamResult(models.Model):
     session = models.ForeignKey(PracticalExamSession, on_delete=models.CASCADE)
     score = models.FloatField()

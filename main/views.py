@@ -1,20 +1,13 @@
-from datetime import time, timedelta
-import os
-import platform
-import tempfile
-import threading
+from datetime import timedelta
 from django.shortcuts import get_object_or_404
-import docker
 from rest_framework import viewsets, status
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from .models import *
 from .serializers import *
-from .utils import process_excel
 from django.utils import timezone
 from django.http import HttpResponse
 import pandas as pd
-from django.db.models import Q
 from rest_framework.views import APIView
 from rest_framework.permissions import AllowAny
 from rest_framework.authtoken.models import Token
@@ -26,6 +19,12 @@ from rest_framework.authentication import TokenAuthentication
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from django.conf import settings
 import random
+from django.db.models import Prefetch
+from .serializers import StudentExamSerializer
+from django.core.mail import send_mail
+import threading
+
+
 
 
 logger = logging.getLogger(__name__)
@@ -35,54 +34,33 @@ User = get_user_model()
 class UserViewSet(viewsets.ModelViewSet):
     queryset = User.objects.all()
     serializer_class = UserSerializer
+    permission_classes = [IsAuthenticated, IsAdminUserOnly]
+    authentication_classes = [TokenAuthentication]
 
 
 class LoginView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
-        username_or_email = request.data.get('username_or_email')
-        password = request.data.get('password')
-
-        if not username_or_email or not password:
-            return Response({"error": "Username/email and password required."}, status=status.HTTP_400_BAD_REQUEST)
-
-        user_qs = User.objects.filter(Q(username=username_or_email) | Q(email=username_or_email))
-        if not user_qs.exists():
-            return Response({"username_or_email": ["User with this email or username does not exist."]}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Try authenticate by username first
-        user = authenticate(username=username_or_email, password=password)
-
-        # If not found, try by email username
-        if not user:
-            try:
-                email_user = User.objects.get(email=username_or_email)
-                user = authenticate(username=email_user.username, password=password)
-            except User.DoesNotExist:
-                user = None
-
-        if not user:
-            return Response({"password": ["Incorrect password."]}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
+        serializer = LoginSerializer(data=request.data)
+        if serializer.is_valid():
+            user = serializer.validated_data['user']
             token, created = Token.objects.get_or_create(user=user)
-        except Exception:
-            return Response({"error": "Authentication system error. Please contact support."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        return Response({
-            "id": user.id,
-            "username": user.username,
-            "email": user.email,
-            "role": getattr(user, "user_type", None),
-            "token": token.key,
-            "refresh_token": token.key,  # Placeholder; replace with real refresh token system
-            "force_password_change": getattr(user, "force_password_change", False),
-            "first_name": user.first_name,
-            "is_verified": getattr(user, "is_verified", False)
-        }, status=status.HTTP_200_OK)
-
-
+            
+            return Response({
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "role": user.user_type,
+                "token": token.key,
+                "refresh_token": token.key,  # In a real app, use proper refresh tokens
+                "force_password_change": user.force_password_change,
+                "first_name": user.first_name,
+                "is_verified": user.is_verified,
+                "subjects": SubjectSerializer(user.subjects.all(), many=True).data
+            }, status=status.HTTP_200_OK)
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 class StudentViewSet(viewsets.ModelViewSet):
     queryset = User.objects.filter(user_type='student')
@@ -91,8 +69,6 @@ class StudentViewSet(viewsets.ModelViewSet):
     authentication_classes = [TokenAuthentication]
 
     def list(self, request, *args, **kwargs):
-        print("Logged in user:", request.user)
-        print("Returning students:", self.get_queryset())
         return super().list(request, *args, **kwargs)
 
     def create(self, request, *args, **kwargs):
@@ -113,28 +89,47 @@ class StudentViewSet(viewsets.ModelViewSet):
     def update(self, request, *args, **kwargs):
         partial = kwargs.pop('partial', False)
         instance = self.get_object()
-        old_email = instance.email
 
         serializer = self.get_serializer(instance, data=request.data, partial=partial)
         serializer.is_valid(raise_exception=True)
         self.perform_update(serializer)
 
-        new_email = serializer.validated_data.get('email', old_email)
-
-        if new_email != old_email:
-            send_mail(
-                subject='Your email has been updated',
-                message=(
-                    f'Hello {instance.first_name},\n\n'
-                    f'Your email address has been changed to {new_email}.\n'
-                    'If you did not request this change, please contact support immediately.'
-                ),
-                from_email='no-reply@example.com',
-                recipient_list=[new_email],
-                fail_silently=False,
-            )
-
         return Response(serializer.data, status=status.HTTP_200_OK)
+    
+    @action(detail=True, methods=['POST'])
+    def add_subjects(self, request, pk=None):
+        student = self.get_object()
+        serializer = AddSubjectSerializer(data=request.data)
+        
+        if serializer.is_valid():
+            subject_ids = serializer.validated_data['subject_ids']
+            subjects = Subject.objects.filter(id__in=subject_ids)
+            student.subjects.add(*subjects)
+            
+            return Response(
+                {"detail": "Subjects added successfully."},
+                status=status.HTTP_200_OK
+            )
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    @action(detail=True, methods=['POST'])
+    def remove_subjects(self, request, pk=None):
+        student = self.get_object()
+        serializer = AddSubjectSerializer(data=request.data)
+        
+        if serializer.is_valid():
+            subject_ids = serializer.validated_data['subject_ids']
+            subjects = Subject.objects.filter(id__in=subject_ids)
+            student.subjects.remove(*subjects)
+            
+            return Response(
+                {"detail": "Subjects removed successfully."},
+                status=status.HTTP_200_OK
+            )
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
 
 class ForcePasswordChangeView(APIView):
     permission_classes = [IsAuthenticated]
@@ -154,6 +149,8 @@ class ForcePasswordChangeView(APIView):
 class SubjectViewSet(viewsets.ModelViewSet):
     queryset = Subject.objects.all()
     serializer_class = SubjectSerializer
+    permission_classes = [IsAuthenticated, IsAdminUserOnly]
+    authentication_classes = [TokenAuthentication]
 
 
 class QuestionViewSet(viewsets.ModelViewSet):
@@ -257,6 +254,7 @@ class QuestionViewSet(viewsets.ModelViewSet):
         except Exception as e:
             return Response({'status': 'error', 'message': str(e)}, status=400)
 
+
 class ExamViewSet(viewsets.ModelViewSet):
     queryset = Exam.objects.all()
     serializer_class = ExamSerializer
@@ -266,7 +264,11 @@ class ExamViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         if user.user_type == 'student':
-            return Exam.objects.filter(is_published=True)
+            # Only show exams for the student's subjects
+            return Exam.objects.filter(
+                subject__in=user.subjects.all(),
+                is_published=True
+            )
         return Exam.objects.all()
 
     @action(detail=True, methods=['POST'])
@@ -276,10 +278,15 @@ class ExamViewSet(viewsets.ModelViewSet):
         exam.save()
         
         message = request.data.get('message', f'New exam "{exam.title}" scheduled')
-        students = User.objects.filter(user_type='student', is_active=True)
+        students = User.objects.filter(
+            user_type='student', 
+            is_active=True,
+            subjects=exam.subject  # Only notify students with this subject
+        )
         
         for student in students:
             if student.email:
+
                 send_mail(
                     subject=f"New Exam: {exam.title}",
                     message=message,
@@ -299,6 +306,28 @@ class ExamViewSet(viewsets.ModelViewSet):
         exam.is_published = False
         exam.save()
         return Response({'status': 'unpublished'})
+    
+
+class StudentExamViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = StudentExamSerializer
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.user_type == 'student':
+            # Only show exams for the student's subjects
+            return Exam.objects.filter(
+                subject__in=user.subjects.all(),
+                is_published=True
+            )
+        return Exam.objects.none()
+    
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context['request'] = self.request
+        return context
+        
 
 class ExamSessionViewSet(viewsets.ModelViewSet):
     serializer_class = ExamSessionSerializer
@@ -307,11 +336,17 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
+        queryset = ExamSession.objects.select_related(
+            'exam', 'exam__subject'
+        ).prefetch_related(
+            Prefetch('answers', queryset=Answer.objects.select_related('question')),
+            Prefetch('exam__examquestion_set', 
+                     queryset=ExamQuestion.objects.select_related('question'))
+        )
+        
         if user.user_type == 'student':
-            return ExamSession.objects.filter(student=user)
-        elif user.user_type == 'teacher':
-            return ExamSession.objects.filter(exam__subject__teacher=user)
-        return ExamSession.objects.all()
+            return queryset.filter(student=user)
+        return queryset
 
     def create(self, request, *args, **kwargs):
         student = request.user
@@ -321,6 +356,13 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
             return Response({'error': 'Exam required'}, status=400)
 
         exam = get_object_or_404(Exam, id=exam_id)
+        
+        # Check if student has this subject
+        if student.user_type == 'student' and exam.subject not in student.subjects.all():
+            return Response(
+                {'error': 'You are not enrolled in this subject'},
+                status=status.HTTP_403_FORBIDDEN
+            )
 
         # Strict mode validation
         if exam.mode == 'strict':
@@ -368,6 +410,13 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
             return Response(
                 {'error': 'Exam not found'},
                 status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check if student has this subject
+        if student.user_type == 'student' and exam.subject not in student.subjects.all():
+            return Response(
+                {'error': 'You are not enrolled in this subject'},
+                status=status.HTTP_403_FORBIDDEN
             )
 
         try:
@@ -540,6 +589,8 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
 
         return Response(ResultSerializer(result).data, status=200)
 
+
+
 class AnswerViewSet(viewsets.ModelViewSet):
     serializer_class = AnswerSerializer
     permission_classes = [IsAuthenticated]
@@ -555,6 +606,7 @@ class AnswerViewSet(viewsets.ModelViewSet):
         if session.is_completed:
             raise ValidationError("Session already completed")
         serializer.save()
+
 
 class ResultViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = ResultSerializer
@@ -680,7 +732,6 @@ class GetStudentEmailView(APIView):
             return Response({'error': 'Student not found'}, status=404)
 
 
-
 class PracticalExamViewSet(viewsets.ModelViewSet):
     queryset = PracticalExam.objects.all()
     serializer_class = PracticalExamSerializer
@@ -690,162 +741,130 @@ class PracticalExamViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         if user.user_type == 'student':
-            return PracticalExam.objects.filter(is_published=True)
+            # Only show practical exams for the student's subjects
+            return PracticalExam.objects.filter(
+                subject__in=user.subjects.all(),
+                is_published=True
+            )
         return PracticalExam.objects.all()
+
+
+
 class PracticalExamSessionViewSet(viewsets.ModelViewSet):
-    """ViewSet for managing practical exam sessions and container lifecycle."""
     queryset = PracticalExamSession.objects.all()
     serializer_class = PracticalExamSessionSerializer
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
-    http_method_names = ['get', 'post', 'delete', 'head', 'options', 'trace']
 
     def get_queryset(self):
-        return PracticalExamSession.objects.filter(student=self.request.user)
-
-    @action(detail=True, methods=['get'])
-    def token(self, request, pk=None):
-        session = self.get_object()
-        return Response({'token': session.token})
-
-    @action(detail=True, methods=['get'])
-    def container_status(self, request, pk=None):
-        session = self.get_object()
-        return Response({
-            'status': session.get_container_status(),
-            'container_id': session.container_id
-        })
-
-    @action(detail=True, methods=['post'], url_path='reset_container')
-    def restart_container(self, request, pk=None):
-        """Stops and removes existing container, resets session state, and starts a new container."""
-        session = self.get_object()
-        try:
-            # Remove existing container if present
-            if session.container_id:
-                try:
-                    client = docker.from_env()
-                    container = client.containers.get(session.container_id)
-                    container.stop(timeout=1)
-                    container.remove(force=True)
-                except docker.errors.NotFound:
-                    pass
-            # Reset session
-            session.container_id = None
-            session.verification_output = None
-            session.is_success = False
-            session.termination_reason = None
-            session.status = 'running'
-            session.save()
-            # Start new container in background
-            threading.Thread(target=session.start_container, daemon=True).start()
-            return Response({'status': 'restarting', 'message': 'Container is being restarted'})
-        except Exception as e:
-            logger.exception("Container restart failed")
-            return Response({'error': 'Container restart failed', 'details': str(e)},
-                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    @action(detail=True, methods=['post'])
-    def submit(self, request, pk=None):
-        """Marks session complete and terminates container."""
-        session = self.get_object()
-        user = request.user
-        if session.student != user:
-            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
-        if session.status != 'running':
-            return Response({'error': 'Session not active', 'current_status': session.status},
-                            status=status.HTTP_400_BAD_REQUEST)
-        try:
-            # End session
-            session.status = 'completed'
-            session.end_time = timezone.now()
-            session.save()
-            # Terminate container
-            session.terminate_container()
-            return Response({'status': 'completed', 'session_id': session.id})
-        except Exception as e:
-            logger.exception("Submit failed")
-            return Response({'error': 'Submit failed', 'details': str(e)},
-                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        user = self.request.user
+        if user.user_type == 'student':
+            return PracticalExamSession.objects.filter(student=user)
+        return PracticalExamSession.objects.all()
 
     def create(self, request, *args, **kwargs):
-        """Creates or returns existing running session for exam."""
-        user = request.user
+        student = request.user
         exam_id = request.data.get('exam')
+        
         if not exam_id:
-            return Response({'error': 'Exam ID required'}, status=status.HTTP_400_BAD_REQUEST)
-        try:
-            existing = PracticalExamSession.objects.filter(student=user, exam_id=exam_id, status='running').first()
-            if existing:
-                data = PracticalExamSessionSerializer(existing).data
-                return Response(data, status=status.HTTP_200_OK)
-            session = PracticalExamSession.objects.create(student=user, exam_id=exam_id, status='starting')
-            threading.Thread(target=session.start_container, daemon=True).start()
-            return Response(PracticalExamSessionSerializer(session).data, status=status.HTTP_201_CREATED)
-        except Exception as e:
-            logger.exception("Session creation failed")
-            return Response({'error': 'Session creation failed', 'details': str(e)},
-                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({'error': 'Exam required'}, status=400)
 
-    @action(detail=True, methods=['post'])
-    def verify(self, request, pk=None):
-        session = self.get_object()
-        user = request.user
-        if session.student != user:
-            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
-        if session.status != 'running':
-            return Response({'error': 'Session not active', 'current_status': session.status},
-                            status=status.HTTP_400_BAD_REQUEST)
-        try:
-            output = session.execute_command(session.exam.verification_command)
-            success = 'success' in output.lower() or 'ok' in output.lower()
-            session.status = 'completed'
-            session.end_time = timezone.now()
-            session.verification_output = output[:10000]
-            session.is_success = success
-            session.save()
-            session.terminate_container()
-            return Response({'is_success': success, 'verification_output': output[:5000]})
-        except Exception as e:
-            logger.exception("Verification failed")
-            return Response({'error': 'Verification failed', 'details': str(e)},
-                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        exam = get_object_or_404(PracticalExam, id=exam_id)
+        
+        # Check if student has this subject
+        if student.user_type == 'student' and exam.subject not in student.subjects.all():
+            return Response(
+                {'error': 'You are not enrolled in this subject'},
+                status=status.HTTP_403_FORBIDDEN
+            )
 
-    @action(detail=True, methods=['post'])
+        # Check if already has a session
+        existing_session = PracticalExamSession.objects.filter(
+            student=student, 
+            exam=exam
+        ).first()
+        
+        if existing_session:
+            return Response(
+                {'error': 'Session already exists for this exam'},
+                status=400
+            )
+
+        session = PracticalExamSession(student=student, exam=exam)
+        session.save()
+        
+        # Start VM in background
+        thread = threading.Thread(target=session.start_vm)
+        thread.daemon = True
+        thread.start()
+
+        serializer = self.get_serializer(session)
+        return Response(serializer.data, status=201)
+    
+    @action(detail=True, methods=['POST'])
     def terminate(self, request, pk=None):
         session = self.get_object()
-        user = request.user
-        if session.student != user:
-            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
-        if session.status != 'running':
-            return Response({'error': 'Session not active', 'current_status': session.status},
-                            status=status.HTTP_400_BAD_REQUEST)
-        reason = request.data.get('reason', 'Terminated by student')[:200]
-        try:
-            session.terminate_container()
-            session.status = 'terminated'
-            session.end_time = timezone.now()
-            session.termination_reason = reason
-            session.save()
-            return Response({'status': 'terminated', 'session_id': session.id, 'termination_reason': reason})
-        except Exception as e:
-            logger.exception("Termination failed")
-            return Response({'error': 'Termination failed', 'details': str(e)},
-                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    def destroy(self, request, *args, **kwargs):
+        if session.student != request.user:
+            raise PermissionDenied("Invalid session owner")
+            
+        session.status = 'terminated'
+        session.termination_reason = request.data.get('reason', 'Manual termination')
+        session.save()
+        
+        return Response({'status': 'session terminated'})
+    
+    @action(detail=True, methods=['POST'])
+    def verify(self, request, pk=None):
         session = self.get_object()
-        if session.status == 'running':
-            session.terminate_container()
-        return super().destroy(request, *args, **kwargs)
-
+        if session.student != request.user:
+            raise PermissionDenied("Invalid session owner")
+            
+        if session.status != 'running':
+            return Response({'error': 'Session is not running'}, status=400)
+            
+        # Execute verification command
+        output = session.execute_command(session.exam.verification_command)
+        session.verification_output = output
+        
+        # Simple success check - in real implementation, parse output to determine success
+        is_success = "success" in output.lower() or "passed" in output.lower()
+        session.is_success = is_success
+        
+        if is_success:
+            session.status = 'completed'
+        else:
+            session.status = 'terminated'
+            session.termination_reason = 'Verification failed'
+            
+        session.end_time = timezone.now()
+        session.save()
+        
+        # Create result
+        result = PracticalExamResult.objects.create(
+            session=session,
+            score=100 if is_success else 0,
+            total_possible=100,
+            details={'verification_output': output, 'success': is_success}
+        )
+        
+        return Response({
+            'status': 'verification completed',
+            'success': is_success,
+            'output': output
+        })
+    
+    @action(detail=True, methods=['GET'])
+    def container_status(self, request, pk=None):
+        session = self.get_object()
+        status = session.get_vm_status()
+        return Response({'status': status, 'container_id': session.vm_name})
 
 
 class PracticalExamResultViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = PracticalExamResultSerializer
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
-
+    
     def get_queryset(self):
         user = self.request.user
         if user.user_type == 'student':
