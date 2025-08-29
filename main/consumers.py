@@ -1,126 +1,138 @@
-import json
-import logging
+# consumers.py
 import asyncio
 import threading
 import time
+import logging
 import urllib.parse
-import paramiko
-from io import StringIO
-
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
-from django.conf import settings
-
-from .models import PracticalExamSession
+import paramiko
+import socket
 
 logger = logging.getLogger(__name__)
 
+from .models import PracticalExamSession
+
 class PracticalTerminalConsumer(AsyncWebsocketConsumer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.ssh_client = None
-        self.ssh_channel = None
-        self.session = None
-        self.connected = False
-
-    def get_token_from_query(self):
-        qs = self.scope.get('query_string', b'').decode()
-        params = urllib.parse.parse_qs(qs)
-        return params.get('token', [None])[0]
-
     async def connect(self):
-        self.session_id = self.scope['url_route']['kwargs']['session_id']
-        self.token = self.get_token_from_query()
-        
-        if not self.token:
+        self.session_id = self.scope['url_route']['kwargs'].get('session_id')
+        qs = self.scope.get('query_string', b'').decode()
+        token = urllib.parse.parse_qs(qs).get('token', [None])[0]
+
+        if not token:
             await self.close(code=4001)
             return
 
-        self.session = await self.get_session()
+        # Get session from DB in async-safe way
+        self.session = await self.get_session(self.session_id, token)
         if not self.session:
             await self.close(code=4003)
             return
 
-        # Connect to VM via SSH
-        if not await self.connect_to_vm():
+        if self.session.status != 'running' or not self.session.ssh_port:
             await self.close(code=4005)
             return
 
-        self.connected = True
+        # Store connection details
+        self.port = self.session.ssh_port
+        self.username = self.session.exam.vm_username
+        self.password = self.session.exam.vm_password
+        
+        # Initialize SSH connection in a thread
+        self.ssh_client = None
+        self.ssh_chan = None
+        self._running = False
+        self.loop = asyncio.get_event_loop()
+        
+        # Connect to SSH in a thread
+        try:
+            self.ssh_client, self.ssh_chan = await self.loop.run_in_executor(
+                None, self._blocking_ssh_connect, self.port, self.username, self.password
+            )
+        except Exception as e:
+            logger.error("SSH connect failed: %s", e)
+            await self.close(code=4006)
+            return
+
+        self._running = True
+        
+        # Start a thread to read from SSH and push to websocket
+        self.reader_thread = threading.Thread(target=self._read_ssh_output, daemon=True)
+        self.reader_thread.start()
+
         await self.accept()
 
     async def disconnect(self, close_code):
-        self.connected = False
-        if self.ssh_channel:
-            self.ssh_channel.close()
-        if self.ssh_client:
-            self.ssh_client.close()
+        self._running = False
+        # Cleanup SSH resources
+        if hasattr(self, 'ssh_chan') and self.ssh_chan:
+            try:
+                self.ssh_chan.close()
+            except Exception:
+                pass
+        if hasattr(self, 'ssh_client') and self.ssh_client:
+            try:
+                self.ssh_client.close()
+            except Exception:
+                pass
 
     async def receive(self, text_data=None, bytes_data=None):
-        if not self.connected or not self.ssh_channel:
-            return
-
-        try:
-            data = bytes_data if bytes_data is not None else text_data.encode('utf-8')
-            self.ssh_channel.send(data)
-        except Exception as e:
-            logger.error(f"Error sending data to SSH: {str(e)}")
-            await self.close(code=4006)
-
-    async def connect_to_vm(self):
-        try:
-            # Create SSH client
-            self.ssh_client = paramiko.SSHClient()
-            self.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            
-            # Connect to VM (using localhost with port forwarding)
-            self.ssh_client.connect(
-                'localhost',
-                port=2222,
-                username=self.session.exam.vm_username,
-                password=self.session.exam.vm_password,
-                timeout=30
-            )
-            
-            # Create interactive shell
-            self.ssh_channel = self.ssh_client.invoke_shell(term='xterm-256color')
-            self.ssh_channel.setblocking(False)
-            
-            # Start thread to read from SSH channel
-            self.read_thread = threading.Thread(target=self.read_ssh_output, daemon=True)
-            self.read_thread.start()
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"SSH connection failed: {str(e)}")
-            return False
-
-    def read_ssh_output(self):
-        while self.connected:
+        if text_data and hasattr(self, 'ssh_chan') and self.ssh_chan and self.ssh_chan.active:
             try:
-                if self.ssh_channel and self.ssh_channel.recv_ready():
-                    data = self.ssh_channel.recv(4096)
-                    if data:
-                        asyncio.run(self.send_output(data))
-                time.sleep(0.1)
+                # Use run_in_executor to avoid blocking the event loop
+                await self.loop.run_in_executor(None, self.ssh_chan.send, text_data.encode('utf-8'))
             except Exception as e:
-                logger.error(f"Error reading SSH output: {str(e)}")
+                logger.error("Error sending to SSH channel: %s", e)
+                await self.close()
+
+    def _blocking_ssh_connect(self, port, username, password):
+        """Blocking SSH connection method to be run in a thread"""
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        # Retry connection up to 3 times with delays
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                client.connect('127.0.0.1', port=int(port), username=username, 
+                              password=password, timeout=15, banner_timeout=30)
+                chan = client.invoke_shell(term='xterm-256color')
+                chan.settimeout(0.5)  # Reduced timeout for better responsiveness
+                return client, chan
+            except (socket.timeout, paramiko.ssh_exception.SSHException) as e:
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(2)  # Wait before retry
+            except Exception as e:
+                raise
+
+    def _read_ssh_output(self):
+        """Thread function to read SSH output and send to WebSocket"""
+        while self._running and self.ssh_chan:
+            try:
+                # Check if data is available with a small timeout
+                if self.ssh_chan.recv_ready():
+                    data = self.ssh_chan.recv(4096)
+                    if data:
+                        # Use the stored event loop to send data
+                        asyncio.run_coroutine_threadsafe(
+                            self.send(bytes_data=data), 
+                            self.loop
+                        )
+                else:
+                    time.sleep(0.01)  # Reduced sleep for better responsiveness
+            except socket.timeout:
+                continue  # Normal timeout, continue reading
+            except Exception as e:
+                if self._running:  # Only log if we're supposed to be running
+                    logger.error("SSH read error: %s", e)
                 break
 
-    async def send_output(self, data):
-        try:
-            await self.send(bytes_data=data)
-        except Exception as e:
-            logger.error(f"Error sending output to WebSocket: {str(e)}")
-
     @database_sync_to_async
-    def get_session(self):
+    def get_session(self, session_id, token):
         try:
-            return PracticalExamSession.objects.get(
-                id=self.session_id,
-                token=self.token,
-                status='running'
+            return PracticalExamSession.objects.select_related('exam').get(
+                id=session_id, token=token
             )
         except PracticalExamSession.DoesNotExist:
             return None

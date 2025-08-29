@@ -1,15 +1,13 @@
 from asyncio.log import logger
+import re
+import uuid
 from django.contrib.auth.models import AbstractUser, BaseUserManager
 from django.db import models
 from django.utils import timezone
-from django.conf import settings
-import secrets
-import time
-import secrets
-import subprocess
-import time
-from django.core.exceptions import ValidationError
-
+from django.db import models
+from django.utils import timezone
+import paramiko
+from .vbox_manager import vbox_manager
 
 
 class UserManager(BaseUserManager):
@@ -167,203 +165,147 @@ class Result(models.Model):
 
 
 class PracticalExam(models.Model):
-    subject = models.ForeignKey('Subject', on_delete=models.CASCADE)
+    subject = models.ForeignKey(Subject, on_delete=models.CASCADE)
     title = models.CharField(max_length=200)
     description = models.TextField()
-    duration = models.PositiveIntegerField(help_text="Duration in minutes")
-    vm_base_name = models.CharField(
-        max_length=255,
-        default="Redhat",
-        help_text="Base VM name to clone from"
-    )
-    vm_snapshot = models.CharField(
-        max_length=255,
-        default="base_snapshot",
-        help_text="Snapshot to use for cloning"
-    )
-    setup_command = models.TextField(
-        help_text="Command to run when session starts",
-        default="echo 'Environment ready'"
-    )
-    verification_command = models.TextField(
-        help_text="Command to verify solution",
-        default="echo 'Verification complete'"
-    )
-    environment_vars = models.JSONField(
-        default=dict,
-        blank=True,
-        help_text="Environment variables (JSON key-value pairs)"
-    )
-    allowed_commands = models.JSONField(
-        default=list,
-        blank=True,
-        help_text="List of allowed commands (empty for all)"
-    )
-    vm_username = models.CharField(
-        max_length=100,
-        default="examuser",
-        help_text="Username to access the VM"
-    )
-    vm_password = models.CharField(
-        max_length=100,
-        default="exampass",
-        help_text="Password to access the VM"
-    )
+
+    # VM settings
+    base_vm_name = models.CharField(max_length=255, default="Redhat")
+    snapshot_name = models.CharField(max_length=255, default="base_snapshot")
+    vm_username = models.CharField(max_length=100, default="kiosk")
+    vm_password = models.CharField(max_length=100, default="redhat")
+
+    # Exam settings
+    duration_minutes = models.PositiveIntegerField(default=60)
+    verification_command = models.TextField(default="echo 'Verification complete'")
+
+    # Publishing + audit fields
     is_published = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
         return self.title
 
+
 class PracticalExamSession(models.Model):
-    STATUS_CHOICES = (
+    STATUS_CHOICES = [
         ('starting', 'Starting'),
         ('running', 'Running'),
         ('completed', 'Completed'),
         ('terminated', 'Terminated'),
         ('failed', 'Failed'),
-    )
-    
-    student = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
-    exam = models.ForeignKey('PracticalExam', on_delete=models.CASCADE)
-    vm_name = models.CharField(max_length=255, null=True, blank=True)
+    ]
+
+    student = models.ForeignKey(User, on_delete=models.CASCADE)
+    exam = models.ForeignKey(PracticalExam, on_delete=models.CASCADE)
     start_time = models.DateTimeField(auto_now_add=True)
     end_time = models.DateTimeField(null=True, blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='starting')
-    verification_output = models.TextField(blank=True, null=True)
+    vm_name = models.CharField(max_length=100, blank=True)
+    ssh_port = models.IntegerField(null=True, blank=True)
+    startup_log = models.TextField(blank=True)
+    verification_output = models.TextField(blank=True)
     is_success = models.BooleanField(default=False)
-    termination_reason = models.TextField(null=True, blank=True)
-    token = models.CharField(max_length=100, default=secrets.token_urlsafe, unique=True)
-    startup_log = models.TextField(blank=True, null=True)
-    ssh_port = models.IntegerField(null=True, blank=True, help_text="SSH port for VM access")
+    termination_reason = models.TextField(blank=True)
+    token = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
 
-    class Meta:
-        unique_together = [('student', 'exam')]
-        ordering = ['-start_time']
-        
+
     def __str__(self):
-        return f"{self.student.username} - {self.exam.title} ({self.status})"
-    
+        return f"{self.student.username} - {self.exam.title}"
+
+    def generate_vm_name(self):
+        sanitized_username = re.sub(r'[^a-zA-Z0-9_-]', '_', self.student.username)
+        return f"exam-session-{self.id}-{sanitized_username}" if self.id else f"exam-session-temp-{sanitized_username}"
+
+    def generate_ssh_port(self):
+        return 2200 + (self.id % 1000) if self.id else 2200
+
     def start_vm(self):
-        """Create and start a VirtualBox VM for the exam session"""
-        from .vbox_settings import vbox_manager
-        log_lines = []
-        
+        """Clone + start the VM"""
         try:
-            # Generate unique VM name
-            self.vm_name = f"exam-{self.exam.id}-{self.student.id}-{secrets.token_hex(4)}"
-            log_lines.append(f"Generated VM name: {self.vm_name}")
-            
-            # Clone the base VM
-            log_lines.append(f"Cloning VM from {self.exam.vm_base_name} with snapshot {self.exam.vm_snapshot}")
-            if not vbox_manager.clone_vm(self.vm_name, self.exam.vm_snapshot):
-                raise Exception("Failed to clone VM")
-            
-            # Configure network
-            log_lines.append("Configuring NAT network")
-            if not vbox_manager.set_network_nat(self.vm_name):
-                raise Exception("Failed to configure network")
-            
-            # Start the VM
-            log_lines.append("Starting VM")
-            if not vbox_manager.start_vm(self.vm_name, headless=True):
-                raise Exception("Failed to start VM")
-            
-            # Wait for VM to boot
-            log_lines.append("Waiting for VM to boot")
-            vbox_manager.wait_for_vm_boot(self.vm_name)
-            log_lines.append("VM is ready")
-            
-            # Execute setup command if defined
-            if self.exam.setup_command:
-                log_lines.append(f"Executing setup command: {self.exam.setup_command}")
-                output = vbox_manager.execute_command_in_vm(
-                    self.vm_name, 
-                    self.exam.setup_command,
-                    self.exam.vm_username,
-                    self.exam.vm_password
-                )
-                log_lines.append(f"Setup command output: {output}")
-                
-            # Update session status
-            self.status = 'running'
+            if not self.id:
+                self.save()
+
+            self.vm_name = self.generate_vm_name()
+            self.ssh_port = self.generate_ssh_port()
+            self.status = 'starting'
             self.save()
-            log_lines.append("VM started successfully")
-            
-        except Exception as e:
-            error_msg = f"VM startup failed: {str(e)}"
-            log_lines.append(error_msg)
-            self.status = 'failed'
-            self.termination_reason = error_msg
-            logger.error(error_msg)
-            
-            # Clean up on failure
-            if self.vm_name:
-                try:
-                    vbox_manager.delete_vm(self.vm_name)
-                except:
-                    pass
-        finally:
-            self.startup_log = "\n".join(log_lines)
-            self.save()
-    
-    def terminate_vm(self):
-        """Terminate and delete the VM"""
-        if not self.vm_name:
-            return
-            
-        try:
-            from .vbox_settings import vbox_manager
-            vbox_manager.delete_vm(self.vm_name)
-            self.vm_name = None
-            self.save()
-            logger.info(f"VM terminated: {self.vm_name}")
-        except Exception as e:
-            logger.error(f"VM termination failed: {str(e)}")
-            raise Exception(f"Failed to clean up exam environment: {str(e)}")
-    
-    def execute_command(self, command):
-        """Execute a command in the VM"""
-        if not self.vm_name:
-            return "No active VM"
-            
-        try:
-            from .vbox_settings import vbox_manager
-            output = vbox_manager.execute_command_in_vm(
-                self.vm_name, 
-                command,
-                self.exam.vm_username,
-                self.exam.vm_password
+
+            # Clone + start VM
+            vbox_manager.clone_vm(
+                self.exam.base_vm_name,
+                self.vm_name,
+                self.exam.snapshot_name,
+                self.ssh_port
             )
+            vbox_manager.start_vm(self.vm_name, headless=True)
+
+            # Wait for SSH
+            if vbox_manager.wait_for_vm_boot(self.vm_name, self.ssh_port):
+                self.status = 'running'
+                self.startup_log = "VM started successfully"
+            else:
+                self.status = 'failed'
+                self.startup_log = "VM failed to start within timeout"
+            self.save()
+
+        except Exception as e:
+            self.status = 'failed'
+            self.startup_log = f"Error starting VM: {str(e)}"
+            self.save()
+            logger.error(f"VM start error: {e}")
+
+    def terminate_vm(self):
+        """Stop + delete the VM"""
+        if self.vm_name:
+            try:
+                vbox_manager.delete_vm(self.vm_name)
+                self.status = 'terminated'
+                self.save()
+            except Exception as e:
+                logger.error(f"Error deleting VM: {e}")
+
+    def execute_command(self, command):
+        """Run command over SSH"""
+        if not self.ssh_port or self.status != 'running':
+            raise Exception("VM not running or SSH not configured")
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(
+                '127.0.0.1',
+                port=self.ssh_port,
+                username=self.exam.vm_username,
+                password=self.exam.vm_password,
+                timeout=10
+            )
+            stdin, stdout, stderr = client.exec_command(command)
+            output = stdout.read().decode() + stderr.read().decode()
+            client.close()
             return output
         except Exception as e:
-            return f"Command execution failed: {str(e)}"
-    
-    def get_vm_status(self):
-        """Get the status of the VM"""
-        if not self.vm_name:
-            return 'not created'
-            
-        try:
-            from .vbox_settings import vbox_manager
-            info = vbox_manager.get_vm_info(self.vm_name)
-            return info.get('VMState', 'unknown')
-        except Exception as e:
-            logger.error(f"VM status error: {str(e)}")
-            return 'error'
+            raise Exception(f"SSH command execution failed: {str(e)}")
 
-    def save(self, *args, **kwargs):
-        if self.status in ['completed', 'terminated'] and self.vm_name:
-            self.terminate_vm()
-        super().save(*args, **kwargs)
+    def get_vm_status(self):
+        """Ask VirtualBox for VM state"""
+        if not self.vm_name:
+            return "not_created"
+        try:
+            info = vbox_manager.get_vm_info(self.vm_name)
+            return info.get("VMState", "unknown")
+        except Exception as e:
+            return f"error: {str(e)}"
+
 
 class PracticalExamResult(models.Model):
-    session = models.ForeignKey(PracticalExamSession, on_delete=models.CASCADE)
-    score = models.FloatField()
-    total_possible = models.FloatField()
-    details = models.JSONField()
+    session = models.OneToOneField(PracticalExamSession, on_delete=models.CASCADE)
+    score = models.IntegerField(default=0)
+    total_possible = models.IntegerField(default=100)
+    details = models.JSONField(default=dict)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return f"Result for {self.session}"
+        return f"{self.session.student.username} - {self.session.exam.title} - {self.score}/{self.total_possible}"
+    

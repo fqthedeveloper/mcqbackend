@@ -170,12 +170,12 @@ SIMPLE_JWT = {
 
 CHANNEL_LAYERS = {
     "default": {
-        "BACKEND": "channels.layers.InMemoryChannelLayer",  # Use Redis in production
-    },
+        "BACKEND": "channels.layers.InMemoryChannelLayer"
+    }
 }
 
 # Docker socket access
 #DOCKER_BASE_URL = "unix://var/run/docker.sock"
 
-VM_SSH_USERNAME = "root"
-VM_SSH_PASSWORD = "redhat" 
+PRACTICAL_BASE_VM = "Redhat"
+PRACTICAL_BASE_SNAPSHOT = "base_snapshot"

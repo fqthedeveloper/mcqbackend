@@ -148,7 +148,7 @@ class StudentCreateSerializer(serializers.ModelSerializer):
                 
                 Your student account has been created/updated.
                 
-                Username: {user.username}
+                Username: {user.email}
                 Password: {password}
                 
                 Please change your password after first login.
@@ -503,7 +503,6 @@ class ResultSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 
-
 class PracticalExamSerializer(serializers.ModelSerializer):
     subject_name = serializers.CharField(source='subject.name', read_only=True)    
     
@@ -512,28 +511,21 @@ class PracticalExamSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
 
+
 class PracticalExamSessionSerializer(serializers.ModelSerializer):
+    exam = serializers.PrimaryKeyRelatedField(queryset=PracticalExam.objects.all())
+    student = serializers.PrimaryKeyRelatedField(read_only=True)
+
     class Meta:
         model = PracticalExamSession
-        fields = '__all__'
-        extra_kwargs = {
-            'student': {'required': False},
-            'token': {'read_only': True},
-            'vm_name': {'read_only': True},
-            'start_time': {'read_only': True},
-            'end_time': {'read_only': True},
-            'status': {'read_only': True},
-            'verification_output': {'read_only': True},
-            'is_success': {'read_only': True},
-            'termination_reason': {'read_only': True},
-            'ssh_port': {'read_only': True},
-        }
+        fields = [
+            'id', 'student', 'exam', 'vm_name', 'ssh_port', 'token', 'status',
+            'start_time', 'end_time', 'startup_log', 'verification_output',
+            'is_success', 'termination_reason'
+        ]
+        read_only_fields = ['vm_name', 'ssh_port', 'token', 'status', 'start_time', 'end_time', 'startup_log', 'verification_output', 'is_success', 'termination_reason']
 
 class PracticalExamResultSerializer(serializers.ModelSerializer):
-    session_info = serializers.SerializerMethodField()
-    exam_title = serializers.CharField(source='session.exam.title', read_only=True)
-    student_name = serializers.CharField(source='session.student.username', read_only=True)
-    
     class Meta:
         model = PracticalExamResult
         fields = '__all__'
