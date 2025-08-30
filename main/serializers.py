@@ -477,6 +477,7 @@ class ExamSerializer(serializers.ModelSerializer):
             except Question.DoesNotExist:
                 continue
 
+
 class ExamSessionSerializer(serializers.ModelSerializer):
     exam = ExamSerializer(read_only=True)  
     exam_title = serializers.CharField(source='exam.title', read_only=True)
@@ -486,6 +487,7 @@ class ExamSessionSerializer(serializers.ModelSerializer):
         model = ExamSession
         fields = '__all__'
         depth = 1
+
 
 class AnswerSerializer(serializers.ModelSerializer):
     class Meta:
@@ -503,6 +505,7 @@ class ResultSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 
+
 class PracticalExamSerializer(serializers.ModelSerializer):
     subject_name = serializers.CharField(source='subject.name', read_only=True)    
     
@@ -510,7 +513,6 @@ class PracticalExamSerializer(serializers.ModelSerializer):
         model = PracticalExam
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
-
 
 class PracticalExamSessionSerializer(serializers.ModelSerializer):
     exam = serializers.PrimaryKeyRelatedField(queryset=PracticalExam.objects.all())
@@ -536,6 +538,7 @@ class PracticalExamResultSerializer(serializers.ModelSerializer):
             'end_time': obj.session.end_time,
             'duration': (obj.session.end_time - obj.session.start_time).total_seconds() if obj.session.end_time else None
         }
+        
     
 
 class StudentExamSerializer(serializers.ModelSerializer):

@@ -749,7 +749,6 @@ class PracticalExamViewSet(viewsets.ModelViewSet):
         return PracticalExam.objects.all()
 
 
-
 class PracticalExamSessionViewSet(viewsets.ModelViewSet):
     queryset = PracticalExamSession.objects.all()
     serializer_class = PracticalExamSessionSerializer
@@ -791,34 +790,42 @@ class PracticalExamSessionViewSet(viewsets.ModelViewSet):
     def terminate(self, request, pk=None):
         session = self.get_object()
         if session.student != request.user:
-            raise PermissionDenied("Invalid session owner")
+            return Response({'error': 'Invalid session owner'}, status=status.HTTP_403_FORBIDDEN)
+        
         reason = request.data.get('reason', 'Manual termination')
         session.termination_reason = reason
         session.terminate_vm()
         session.status = 'terminated'
         session.end_time = timezone.now()
         session.save()
+        
         return Response({'status': 'session terminated'})
 
     @action(detail=True, methods=['POST'])
     def verify(self, request, pk=None):
-        session = self.get_object()
+        session = get_object_or_404(PracticalExamSession, pk=pk)
         if session.student != request.user:
-            raise PermissionDenied("Invalid session owner")
+            return Response({'error': 'Invalid session owner'}, status=status.HTTP_403_FORBIDDEN)
         if session.status != 'running':
-            return Response({'error': 'Session not running'}, status=400)
+            return Response({'error': 'Session not running'}, status=status.HTTP_400_BAD_REQUEST)
         try:
             cmd = session.exam.verification_command or "echo verification"
             output = session.execute_command(cmd)
             session.verification_output = output
-            is_success = "success" in (output or "").lower() or "passed" in (output or "").lower()
+            
+            # Check for success indicators in output
+            is_success = any(indicator in output.lower() 
+                           for indicator in ['success', 'passed', 'completed', 'verification complete'])
             session.is_success = is_success
             session.status = 'completed' if is_success else 'terminated'
+            
             if not is_success:
                 session.termination_reason = 'Verification failed'
+            
             session.end_time = timezone.now()
             session.save()
 
+            # Create exam result
             result = PracticalExamResult.objects.create(
                 session=session,
                 score=100 if is_success else 0,
@@ -826,9 +833,15 @@ class PracticalExamSessionViewSet(viewsets.ModelViewSet):
                 details={'verification_output': output, 'success': is_success}
             )
 
-            return Response({'status': 'verification completed', 'success': is_success, 'output': output})
+            return Response({
+                'status': 'verification completed', 
+                'success': is_success, 
+                'output': output,
+                'result_id': result.id
+            })
+            
         except Exception as e:
-            return Response({'error': str(e)}, status=500)
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['GET'])
     def vm_status(self, request, pk=None):
@@ -843,17 +856,17 @@ class PracticalExamSessionViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("Invalid session owner")
         session.terminate_vm()
         session.status = 'starting'
-        session.startup_log = None
-        session.verification_output = None
+        session.startup_log = ''  # Fixed: Set to empty string instead of None
+        session.verification_output = ''  # Fixed: Set to empty string instead of None
         session.is_success = False
-        session.termination_reason = None
+        session.termination_reason = ''  # Fixed: Set to empty string instead of None
         session.save()
         t = threading.Thread(target=session.start_vm, daemon=True)
         t.start()
         return Response({'status': 'VM restart initiated'})
     
     
-
+    
 class PracticalExamResultViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = PracticalExamResultSerializer
     authentication_classes = [TokenAuthentication]

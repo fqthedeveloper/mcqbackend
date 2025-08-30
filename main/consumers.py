@@ -1,4 +1,3 @@
-# consumers.py
 import asyncio
 import threading
 import time
