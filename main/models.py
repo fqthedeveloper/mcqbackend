@@ -1,4 +1,5 @@
 from asyncio.log import logger
+import random
 import re
 import threading
 import uuid
@@ -9,6 +10,9 @@ from django.db import models
 from django.utils import timezone
 import paramiko
 from .vbox_manager import vbox_manager
+from .verification import verification_system
+
+
 
 
 class UserManager(BaseUserManager):
@@ -220,7 +224,16 @@ class PracticalExamSession(models.Model):
         return f"exam-session-{self.id}-{sanitized_username}" if self.id else f"exam-session-temp-{sanitized_username}"
 
     def generate_ssh_port(self):
-        return 2200 + (self.id % 1000) if self.id else 2200
+        # Generate a unique port between 2200 and 3200
+        used_ports = PracticalExamSession.objects.exclude(ssh_port__isnull=True).values_list('ssh_port', flat=True)
+        base_port = 2200
+        max_port = 3200
+        
+        for port in range(base_port, max_port + 1):
+            if port not in used_ports:
+                return port
+        # If all ports are used (unlikely), return a random one
+        return random.randint(base_port, max_port)
 
     def start_vm(self):
         from .vbox_manager import vbox_manager
@@ -315,6 +328,36 @@ class PracticalExamSession(models.Model):
             
         info = vbox_manager.get_vm_info(self.vm_name)
         return info.get("VMState", "unknown")
+    
+    def save(self, *args, **kwargs):
+        # Auto-submit if time is up and exam is still running
+        if (self.status == 'running' and self.end_time and 
+            timezone.now() > self.end_time):
+            self.auto_submit()
+        
+        super().save(*args, **kwargs)
+    
+    def auto_submit(self):
+        """Automatically submit the exam when time is up"""
+        try:
+            self.terminate_vm()
+            self.status = 'verifying'
+            self.save()
+            
+            # Run verification in background
+            def run_verification():
+                success = verification_system.run_verification(self.id)
+                if not success:
+                    self.status = 'failed'
+                    self.save()
+            
+            thread = threading.Thread(target=run_verification, daemon=True)
+            thread.start()
+            
+        except Exception as e:
+            logger.error(f"Error in auto-submit for session {self.id}: {str(e)}")
+            self.status = 'failed'
+            self.save()
 
 
 class PracticalExamResult(models.Model):
