@@ -505,7 +505,6 @@ class ResultSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 
-
 class PracticalExamSerializer(serializers.ModelSerializer):
     subject_name = serializers.CharField(source='subject.name', read_only=True)    
     
@@ -513,6 +512,7 @@ class PracticalExamSerializer(serializers.ModelSerializer):
         model = PracticalExam
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
+
 
 class PracticalExamSessionSerializer(serializers.ModelSerializer):
     exam = serializers.PrimaryKeyRelatedField(queryset=PracticalExam.objects.all())
@@ -539,7 +539,6 @@ class PracticalExamResultSerializer(serializers.ModelSerializer):
             'duration': (obj.session.end_time - obj.session.start_time).total_seconds() if obj.session.end_time else None
         }
         
-    
 
 class StudentExamSerializer(serializers.ModelSerializer):
     subject_name = serializers.CharField(source='subject.name', read_only=True)

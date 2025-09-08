@@ -25,8 +25,8 @@ from .serializers import StudentExamSerializer
 from django.core.mail import send_mail
 import threading
 from .verification import verification_system
-
-
+import socket
+import json
 
 
 logger = logging.getLogger(__name__)
@@ -744,12 +744,13 @@ class PracticalExamViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         if user.user_type == 'student':
-            # Only show practical exams for the student's subjects
+            
             return PracticalExam.objects.filter(
                 subject__in=user.subjects.all(),
                 is_published=True
             )
         return PracticalExam.objects.all()
+
 
 
 class PracticalExamSessionViewSet(viewsets.ModelViewSet):
@@ -776,11 +777,11 @@ class PracticalExamSessionViewSet(viewsets.ModelViewSet):
 
         # Check if student already has an active session for this exam
         existing = PracticalExamSession.objects.filter(
-            student=student, 
+            student=student,
             exam=exam,
             status__in=['starting', 'running']
         ).first()
-        
+
         if existing:
             return Response({
                 'error': 'You already have an active session for this exam',
@@ -798,7 +799,7 @@ class PracticalExamSessionViewSet(viewsets.ModelViewSet):
 
         serializer = self.get_serializer(session)
         return Response(serializer.data, status=201)
-    
+
     def start_vm_with_limits(self, session):
         """Start VM with resource limits to prevent system overload"""
         try:
@@ -806,12 +807,12 @@ class PracticalExamSessionViewSet(viewsets.ModelViewSet):
             active_vms = PracticalExamSession.objects.filter(
                 status__in=['starting', 'running']
             ).count()
-            
+
             # If too many VMs are running, wait before starting a new one
             if active_vms > 10:  # Adjust based on your system capacity
                 time.sleep(30)
-            
-            # Start the VM
+
+            # Start the VM (this updates session.status to 'running' on success)
             session.start_vm()
         except Exception as e:
             logger.error(f"Failed to start VM for session {session.id}: {str(e)}")
@@ -824,63 +825,187 @@ class PracticalExamSessionViewSet(viewsets.ModelViewSet):
         session = self.get_object()
         if session.student != request.user:
             return Response({'error': 'Invalid session owner'}, status=status.HTTP_403_FORBIDDEN)
-        
+
         reason = request.data.get('reason', 'Manual termination')
         session.termination_reason = reason
         session.terminate_vm()
         session.status = 'terminated'
         session.end_time = timezone.now()
         session.save()
-        
+
         return Response({'status': 'session terminated'})
+
+    def _run_verification_background(self, session_id):
+        """
+        Background thread target: run verification, persist result, email student.
+        This keeps the HTTP response fast while the heavy verification runs asynchronously.
+        """
+        try:
+            from .verification import verification_system
+        except Exception:
+            verification_system = None
+
+        try:
+            session = PracticalExamSession.objects.select_related('exam', 'student').get(id=session_id)
+        except PracticalExamSession.DoesNotExist:
+            logger.error("Verification: session %s no longer exists", session_id)
+            return
+
+        # Defensive: ensure status is 'verifying'
+        session.status = 'verifying'
+        session.save()
+
+        result = None
+        try:
+            if verification_system and hasattr(verification_system, 'run_verification'):
+                # This call may take time — it's in background thread
+                # Expect a dict: {'status': 'completed', 'score': 80, 'details': {...}, 'is_success': True}
+                result = verification_system.run_verification(session.id)
+            else:
+                # Fallback simple verification (if no system available)
+                # mark as failed (or create a dummy result)
+                result = {
+                    'status': 'failed',
+                    'score': 0,
+                    'details': {'error': 'verification system not available'},
+                    'is_success': False
+                }
+
+            # Normalize result
+            status_str = result.get('status', 'failed')
+            score = int(result.get('score', 0))
+            details = result.get('details', {})
+            is_success = bool(result.get('is_success', False))
+
+            # Persist verification output on the session
+            session.verification_output = json.dumps(details, default=str)
+            session.is_success = is_success
+            session.status = 'completed' if status_str == 'completed' else 'failed'
+            session.end_time = session.end_time or timezone.now()
+            session.save()
+
+            # Create or update PracticalExamResult
+            # If result already exists (rare), update it
+            preexisting = PracticalExamResult.objects.filter(session=session).first()
+            if preexisting:
+                preexisting.score = score
+                preexisting.details = details or {}
+                preexisting.created_at = timezone.now()
+                preexisting.save()
+                exam_result = preexisting
+            else:
+                total_possible = getattr(session.exam, 'total_marks', 100) if session.exam else 100
+                exam_result = PracticalExamResult.objects.create(
+                    session=session,
+                    score=score,
+                    total_possible=total_possible,
+                    details=details or {}
+                )
+
+            # Send email to student with results
+            try:
+                student_email = session.student.email
+                if student_email:
+                    subject = f"Your practical exam results — {session.exam.title}"
+                    body_lines = [
+                        f"Hello {session.student.get_full_name() or session.student.username},",
+                        "",
+                        f"Your practical exam '{session.exam.title}' has been verified.",
+                        f"Result: {score}/{exam_result.total_possible}",
+                        "",
+                        "Details:",
+                        json.dumps(details, indent=2, default=str),
+                        "",
+                        "If you have any questions, please contact your instructor."
+                    ]
+                    message = "\n".join(body_lines)
+                    from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', None) or 'no-reply@example.com'
+                    # send_mail may raise, catch and log
+                    send_mail(subject, message, from_email, [student_email], fail_silently=False)
+                    logger.info("Sent verification email to %s for session %s", student_email, session.id)
+                else:
+                    logger.warning("Student has no email, skipping result email for session %s", session.id)
+            except Exception as send_err:
+                logger.exception("Failed to send verification email for session %s: %s", session.id, send_err)
+
+        except Exception as e:
+            logger.exception("Error running verification for session %s: %s", session.id if 'session' in locals() else session_id, e)
+            try:
+                session.status = 'failed'
+                session.verification_output = json.dumps({'error': str(e)})
+                session.save()
+            except Exception:
+                pass
 
     @action(detail=True, methods=['POST'])
     def verify(self, request, pk=None):
+        """
+        Start verification for a session.
+
+        Behavior:
+        - Only allow session owner (student) to trigger verification.
+        - Terminates VM, sets session.status='verifying', starts background verification.
+        - Immediately returns status that verification has started; final results are sent by email
+          and stored in PracticalExamResult once ready.
+        """
         session = get_object_or_404(PracticalExamSession, pk=pk)
-        if session.student != request.user:
+        if session.student != request.user and not request.user.is_staff:
             return Response({'error': 'Invalid session owner'}, status=status.HTTP_403_FORBIDDEN)
-        if session.status != 'running':
+        if session.status not in ['running', 'starting']:
             return Response({'error': 'Session not running'}, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Terminate the VM first
-        session.terminate_vm()
+
+        # Terminate the VM first (best-effort)
+        try:
+            session.terminate_vm()
+        except Exception as e:
+            logger.exception("Error terminating VM prior to verification for session %s: %s", session.id, e)
+
         session.status = 'verifying'
         session.save()
-        
-        # Run verification using the improved verification system
-        result = verification_system.run_verification(session.id)
-        
+
+        # Start verification in background thread
+        t = threading.Thread(target=self._run_verification_background, args=(session.id,), daemon=True)
+        t.start()
+
         return Response({
-            'status': result.get('status', 'started'), 
-            'message': 'Verification process has started. Results will be available shortly.'
+            'status': 'started',
+            'message': 'Verification process has started. Results will be emailed and available via the results endpoint when ready.'
         })
 
     @action(detail=True, methods=['GET'])
     def verification_status(self, request, pk=None):
         """Check the status of a verification process"""
         session = get_object_or_404(PracticalExamSession, pk=pk)
-        if session.student != request.user:
+        if session.student != request.user and not request.user.is_staff:
             return Response({'error': 'Invalid session owner'}, status=status.HTTP_403_FORBIDDEN)
-        
-        # Check if verification is complete
+
+        # If verification already completed and result exists, return it
         if session.status in ['completed', 'failed']:
+            # try to attach result if exists
+            res_obj = PracticalExamResult.objects.filter(session=session).first()
             return Response({
                 'status': session.status,
                 'completed': True,
                 'is_success': session.is_success,
-                'score': getattr(session, 'score', None),
-                'details': getattr(session, 'verification_output', {})
+                'score': res_obj.score if res_obj else getattr(session, 'score', None),
+                'details': res_obj.details if res_obj else (json.loads(session.verification_output) if session.verification_output else {}),
             })
-        
-        # Check if verification is still in progress
-        status_info = verification_system.get_verification_status(session.id)
-        if status_info:
-            return Response(status_info)
-        
+
+        # Otherwise try to get status from verification_system (if available)
+        try:
+            from .verification import verification_system
+            status_info = verification_system.get_verification_status(session.id)
+            if status_info:
+                return Response(status_info)
+        except Exception:
+            # ignore if verification_system isn't available
+            pass
+
         return Response({
-            'status': 'unknown',
-            'message': 'Verification status could not be determined'
-        }, status=404)
+            'status': session.status or 'verifying',
+            'completed': False,
+            'message': 'Verification is in progress'
+        }, status=200)
 
     @action(detail=True, methods=['GET'])
     def vm_status(self, request, pk=None):
@@ -900,41 +1025,80 @@ class PracticalExamSessionViewSet(viewsets.ModelViewSet):
         session.is_success = False
         session.termination_reason = ''
         session.save()
-        
+
         # Start VM in background thread with limits
         t = threading.Thread(target=self.start_vm_with_limits, args=(session,), daemon=True)
         t.start()
-        
+
         return Response({'status': 'VM restart initiated'})
-    
+
     @action(detail=False, methods=['POST'])
     def cleanup_stuck_sessions(self, request):
         """Admin endpoint to cleanup stuck sessions"""
         if not request.user.is_staff:
             return Response({'error': 'Permission denied'}, status=403)
-        
+
         # Clean up stuck verification processes
-        verification_system.cleanup_stuck_processes()
-        
+        try:
+            from .verification import verification_system
+            verification_system.cleanup_stuck_processes()
+        except Exception:
+            logger.exception("Failed to cleanup stuck verification processes")
+
         # Clean up stuck VM sessions
         stuck_sessions = PracticalExamSession.objects.filter(
             status__in=['starting', 'running'],
             start_time__lt=timezone.now() - timezone.timedelta(minutes=30)
         )
-        
+
         for session in stuck_sessions:
-            session.terminate_vm()
-            session.status = 'failed'
-            session.termination_reason = 'Session was stuck and automatically terminated'
-            session.save()
-        
+            try:
+                session.terminate_vm()
+                session.status = 'failed'
+                session.termination_reason = 'Session was stuck and automatically terminated'
+                session.save()
+            except Exception:
+                logger.exception("Failed cleaning stuck session %s", session.id)
+
         return Response({
             'status': 'cleanup_completed',
             'sessions_terminated': stuck_sessions.count()
         })
-    
-       
-    
+
+    @action(detail=True, methods=['GET'])
+    def check_ssh(self, request, pk=None):
+        """
+        Check whether the forwarded SSH port for the session is accepting TCP connections.
+        Returns JSON: { ready: bool, port: int?, reason?: str }
+        Permission: session owner (student) or staff.
+        """
+        session = self.get_object()  # respects viewset queryset/permissions
+
+        # owner or staff only
+        if session.student != request.user and not request.user.is_staff:
+            return Response({'detail': 'Permission denied'}, status=403)
+
+        port = session.ssh_port
+        if not port:
+            return Response({'ready': False, 'reason': 'ssh_port not assigned yet'}, status=200)
+
+        # Use VM_HOST setting so Django in container can reach host's forwarded port if needed
+        vm_host = getattr(settings, 'VM_HOST', '127.0.0.1')
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1.5)  # short timeout
+        try:
+            sock.connect((vm_host, int(port)))
+            return Response({'ready': True, 'port': int(port)}, status=200)
+        except Exception as e:
+            # return ready: false with a short reason for debugging
+            return Response({'ready': False, 'port': int(port), 'reason': str(e)}, status=200)
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
 class PracticalExamResultViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = PracticalExamResultSerializer
     authentication_classes = [TokenAuthentication]

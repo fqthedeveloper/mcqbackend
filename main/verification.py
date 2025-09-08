@@ -7,6 +7,8 @@ import os
 import signal
 from django.utils import timezone
 from django.db import transaction
+from django.conf import settings
+from django.core.mail import send_mail
 
 logger = logging.getLogger(__name__)
 
@@ -123,18 +125,29 @@ class ExamVerificationSystem:
                         
                         # Use atomic transaction for database operations
                         with transaction.atomic():
-                            PracticalExamResult.objects.create(
+                            # Create or update result
+                            result, created = PracticalExamResult.objects.get_or_create(
                                 session=session,
-                                score=verification_data.get('score', 0),
-                                total_possible=verification_data.get('total_possible', 100),
-                                details=verification_data.get('details', {})
+                                defaults={
+                                    'score': verification_data.get('score', 0),
+                                    'total_possible': verification_data.get('total_possible', 100),
+                                    'details': verification_data.get('details', {})
+                                }
                             )
+                            
+                            if not created:
+                                result.score = verification_data.get('score', 0)
+                                result.details = verification_data.get('details', {})
+                                result.save()
                             
                             session.is_success = verification_data.get('passed', False)
                             session.verification_output = stdout
                             session.status = 'completed'
                             session.end_time = timezone.now()
                             session.save()
+                        
+                        # Send email to student
+                        self.send_result_email(session, result)
                         
                         with self.lock:
                             if session_id in self.active_processes:
@@ -181,6 +194,33 @@ class ExamVerificationSystem:
                     self.active_processes[session_id]['status'] = 'failed'
                     self.active_processes[session_id]['error'] = str(e)
                     # Don't delete immediately - allow inspection
+    
+    def send_result_email(self, session, result):
+        """Send email to student with exam results"""
+        try:
+            subject = f"Practical Exam Results: {session.exam.title}"
+            message = f"""
+            Hello {session.student.get_full_name() or session.student.username},
+            
+            Your practical exam '{session.exam.title}' has been evaluated.
+            
+            Score: {result.score}/{result.total_possible}
+            Status: {'PASSED' if session.is_success else 'FAILED'}
+            
+            Detailed results:
+            {json.dumps(result.details, indent=2)}
+            
+            Thank you for completing the exam.
+            """
+            
+            from_email = settings.DEFAULT_FROM_EMAIL
+            recipient_list = [session.student.email]
+            
+            send_mail(subject, message, from_email, recipient_list, fail_silently=False)
+            logger.info(f"Result email sent to {session.student.email} for session {session.id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to send result email for session {session.id}: {str(e)}")
     
     def get_verification_status(self, session_id):
         """Get the current status of a verification process"""

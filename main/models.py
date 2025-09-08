@@ -170,29 +170,24 @@ class Result(models.Model):
 
 
 class PracticalExam(models.Model):
-    subject = models.ForeignKey(Subject, on_delete=models.CASCADE)
     title = models.CharField(max_length=200)
     description = models.TextField()
-
-    # VM settings
-    base_vm_name = models.CharField(max_length=255, default="Redhat")
-    snapshot_name = models.CharField(max_length=255, default="base_snapshot")
-    vm_username = models.CharField(max_length=100, default="kiosk")
-    vm_password = models.CharField(max_length=100, default="redhat")
-
-    # Exam settings
-    duration_minutes = models.PositiveIntegerField(default=60)
-    verification_command = models.TextField(default="echo 'Verification complete'")
-
-    # Publishing + audit fields
-    is_published = models.BooleanField(default=False)
+    subject = models.ForeignKey(Subject, on_delete=models.CASCADE)
+    base_vm_name = models.CharField(max_length=100)
+    snapshot_name = models.CharField(max_length=100)
+    vm_username = models.CharField(max_length=50, default='student')
+    vm_password = models.CharField(max_length=50, default='password')
+    duration_minutes = models.IntegerField(default=60)
+    total_marks = models.IntegerField(default=100)
+    verification_command = models.TextField(blank=True)
     is_active = models.BooleanField(default=True)
+    is_published = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-
+    
     def __str__(self):
         return self.title
-
+    
 
 class PracticalExamSession(models.Model):
     STATUS_CHOICES = [
@@ -201,10 +196,11 @@ class PracticalExamSession(models.Model):
         ('completed', 'Completed'),
         ('terminated', 'Terminated'),
         ('failed', 'Failed'),
+        ('verifying', 'Verifying'),
     ]
     
     student = models.ForeignKey(User, on_delete=models.CASCADE)
-    exam = models.ForeignKey('PracticalExam', on_delete=models.CASCADE)
+    exam = models.ForeignKey(PracticalExam, on_delete=models.CASCADE)
     vm_name = models.CharField(max_length=100, blank=True, default='')
     ssh_port = models.IntegerField(blank=True, null=True)
     token = models.CharField(max_length=100, unique=True, default=uuid.uuid4)
@@ -260,6 +256,7 @@ class PracticalExamSession(models.Model):
             if vbox_manager.wait_for_vm_boot(self.vm_name, self.ssh_port):
                 self.status = 'running'
                 self.startup_log = "VM started successfully"
+                self.end_time = timezone.now() + timezone.timedelta(minutes=self.exam.duration_minutes)
                 self.save()
                 
                 # Schedule auto-termination at exam end time
@@ -269,6 +266,7 @@ class PracticalExamSession(models.Model):
                     self.auto_terminate,
                     kwargs={'reason': 'Exam time expired'}
                 )
+                timer.daemon = True
                 timer.start()
             else:
                 self.status = 'failed'
@@ -291,7 +289,10 @@ class PracticalExamSession(models.Model):
     def terminate_vm(self):
         from .vbox_manager import vbox_manager
         if self.vm_name and self.vm_name != '':
-            vbox_manager.delete_vm(self.vm_name)
+            try:
+                vbox_manager.delete_vm(self.vm_name)
+            except Exception as e:
+                logger.error(f"Error terminating VM {self.vm_name}: {str(e)}")
             # Don't set vm_name to None, just clear it
             self.vm_name = ''
 
@@ -346,8 +347,14 @@ class PracticalExamSession(models.Model):
             
             # Run verification in background
             def run_verification():
-                success = verification_system.run_verification(self.id)
-                if not success:
+                try:
+                    from .verification import verification_system
+                    success = verification_system.run_verification(self.id)
+                    if not success:
+                        self.status = 'failed'
+                        self.save()
+                except Exception as e:
+                    logger.error(f"Error in verification for session {self.id}: {str(e)}")
                     self.status = 'failed'
                     self.save()
             
@@ -358,7 +365,6 @@ class PracticalExamSession(models.Model):
             logger.error(f"Error in auto-submit for session {self.id}: {str(e)}")
             self.status = 'failed'
             self.save()
-
 
 class PracticalExamResult(models.Model):
     session = models.OneToOneField(PracticalExamSession, on_delete=models.CASCADE)
