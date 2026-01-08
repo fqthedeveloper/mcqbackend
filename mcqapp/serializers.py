@@ -17,13 +17,31 @@ User = get_user_model()
 # ================= USER ================= #
 
 class UserSerializer(serializers.ModelSerializer):
+    subjects = serializers.SerializerMethodField()
+
     class Meta:
         model = User
         fields = [
-            'id', 'email', 'username', 'user_type',
-            'is_verified', 'is_active',
-            'first_name', 'last_name'
+            'id',
+            'email',
+            'username',
+            'user_type',
+            'first_name',
+            'last_name',
+            'is_verified',
+            'is_active',
+            'subjects'
         ]
+
+    def get_subjects(self, obj):
+        enrollments = StudentSubjectEnrollment.objects.filter(
+            student=obj,
+            is_active=True
+        )
+        return SubjectSerializer(
+            [e.subject for e in enrollments],
+            many=True
+        ).data
 
 
 class StudentCreateSerializer(serializers.ModelSerializer):
@@ -48,7 +66,6 @@ class StudentCreateSerializer(serializers.ModelSerializer):
         subject_ids = validated_data.pop('subject_ids', [])
         password = get_random_string(10)
 
-        # 1️⃣ Create student
         user = User.objects.create_user(
             email=validated_data['email'],
             username=validated_data.get('username', validated_data['email']),
@@ -60,7 +77,6 @@ class StudentCreateSerializer(serializers.ModelSerializer):
             is_active=True
         )
 
-        # 2️⃣ Assign subjects
         for subject_id in subject_ids:
             StudentSubjectEnrollment.objects.update_or_create(
                 student=user,
@@ -68,28 +84,22 @@ class StudentCreateSerializer(serializers.ModelSerializer):
                 defaults={'is_active': True}
             )
 
-        # 3️⃣ Send credentials email
         send_mail(
-            subject="Student Account Created",
+            subject="IRT Student Account Created - MCQ Exam System",
             message=f"""
                 Hello {user.first_name or user.username},
-
-                Your account has been created.
 
                 Email: {user.email}
                 Password: {password}
 
-                Login URL:
-                http://localhost:3000/login
-
-                You must change your password after first login.
                 """,
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            recipient_list=[user.email],
-            fail_silently=False,
-        )
+                            from_email=settings.DEFAULT_FROM_EMAIL,
+                            recipient_list=[user.email],
+                            fail_silently=False,
+                        )
 
         return user
+
 
 class StudentUpdateSerializer(serializers.ModelSerializer):
     subject_ids = serializers.ListField(
@@ -115,16 +125,15 @@ class StudentUpdateSerializer(serializers.ModelSerializer):
         instance.save()
 
         if subject_ids is not None:
-            # deactivate all
+            # ❗ FULL REPLACE (update, not enroll)
             StudentSubjectEnrollment.objects.filter(
                 student=instance
             ).update(is_active=False)
 
-            # activate selected
-            for subject_id in subject_ids:
+            for sid in subject_ids:
                 StudentSubjectEnrollment.objects.update_or_create(
                     student=instance,
-                    subject_id=subject_id,
+                    subject_id=sid,
                     defaults={'is_active': True}
                 )
 
@@ -144,9 +153,20 @@ class PasswordChangeSerializer(serializers.Serializer):
 # ================= SUBJECT ================= #
 
 class SubjectSerializer(serializers.ModelSerializer):
+    question_count = serializers.SerializerMethodField()
+
     class Meta:
         model = Subject
-        fields = ['id', 'name', 'description', 'is_active']
+        fields = [
+            'id',
+            'name',
+            'description',
+            'is_active',
+            'question_count'
+        ]
+
+    def get_question_count(self, obj):
+        return Question.objects.filter(subject=obj).count()
 
 
 # ================= ENROLLMENT ================= #
@@ -160,40 +180,182 @@ class StudentSubjectEnrollmentSerializer(serializers.ModelSerializer):
 # ================= QUESTION ================= #
 
 class QuestionSerializer(serializers.ModelSerializer):
+    correct_answers = serializers.ListField(
+        child=serializers.CharField(),
+        write_only=True,
+        required=True
+    )
+    
+    subject_name = serializers.CharField(source="subject.name", read_only=True)
+
+
     class Meta:
         model = Question
         fields = [
-            'id', 'subject',
-            'text',
-            'option_a', 'option_b',
-            'option_c', 'option_d',
-            'correct_option', 'marks'
+            "id",
+            "subject",
+            "subject_name",
+            "text",
+            "option_a",
+            "option_b",
+            "option_c",
+            "option_d",
+            "correct_option",
+            "correct_answers",
+            "marks",
+            "explanation",
         ]
+        read_only_fields = ["correct_option"]
 
+    def validate_correct_answers(self, value):
+        # Normalize + validate
+        allowed = {"A", "B", "C", "D"}
+        cleaned = [v.upper() for v in value]
+
+        invalid = set(cleaned) - allowed
+        if invalid:
+            raise serializers.ValidationError(
+                f"Invalid answer(s): {', '.join(invalid)}"
+            )
+
+        return cleaned
+
+    def create(self, validated_data):
+        answers = validated_data.pop("correct_answers")
+        validated_data["correct_option"] = ",".join(answers)
+        return Question.objects.create(**validated_data)
+
+    def update(self, instance, validated_data):
+        answers = validated_data.pop("correct_answers", None)
+
+        if answers is not None:
+            instance.correct_option = ",".join(answers)
+
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+
+        instance.save()
+        return instance
 
 # ================= EXAM (MCQ ONLY) ================= #
 
 class ExamSerializer(serializers.ModelSerializer):
+    # ✅ READ + WRITE (IMPORTANT)
+    questions = serializers.PrimaryKeyRelatedField(
+        queryset=Question.objects.all(),
+        many=True,
+        required=False
+    )
+
+    subject_id = serializers.IntegerField(source="subject.id", read_only=True)
+    subject_name = serializers.CharField(source="subject.name", read_only=True)
+
+    question_count = serializers.SerializerMethodField(read_only=True)
+    question_details = serializers.SerializerMethodField(read_only=True)
+
     class Meta:
         model = Exam
         fields = [
-            'id', 'title', 'subject',
-            'duration', 'mode',
-            'is_published'
+            "id",
+            "title",
+
+            # subject
+            "subject",
+            "subject_id",
+            "subject_name",
+
+            # config
+            "duration",
+            "mode",
+
+            # questions
+            "questions",          # ✅ FIX
+            "question_details",
+            "question_count",
+
+            # meta
+            "is_published",
+            "created_at",
         ]
 
+    def get_question_count(self, obj):
+        return obj.questions.count()
 
-# ================= SESSION ================= #
+    def get_question_details(self, obj):
+        return QuestionSerializer(obj.questions.all(), many=True).data
+
+    def validate_questions(self, value):
+        if len(value) > 100:
+            raise serializers.ValidationError(
+                "Maximum 100 questions allowed in an exam."
+            )
+        return value
+
+    def create(self, validated_data):
+        questions = validated_data.pop("questions", [])
+        exam = Exam.objects.create(**validated_data)
+        exam.questions.set(questions)
+        return exam
+
+    def update(self, instance, validated_data):
+        questions = validated_data.pop("questions", None)
+
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+
+        instance.save()
+
+        if questions is not None:
+            instance.questions.set(questions)
+
+        return instance
+    
 
 class ExamSessionSerializer(serializers.ModelSerializer):
+    exam = ExamSerializer(read_only=True)
+    exam_id = serializers.IntegerField(write_only=True)
+
     class Meta:
         model = ExamSession
         fields = [
-            'id', 'student', 'exam',
-            'start_time', 'end_time',
-            'is_completed'
+            "id",
+            "exam",
+            "exam_id",
+            "start_time",
+            "end_time",
+            "is_completed",
+        ]
+        read_only_fields = [
+            "id",
+            "exam",
+            "start_time",
+            "end_time",
+            "is_completed",
         ]
 
+    def create(self, validated_data):
+        request = self.context["request"]
+        user = request.user
+        exam_id = validated_data["exam_id"]
+
+        exam = Exam.objects.get(id=exam_id, is_published=True)
+
+        allowed = StudentSubjectEnrollment.objects.filter(
+            student=user,
+            subject=exam.subject,
+            is_active=True,
+        ).exists()
+
+        if not allowed:
+            raise serializers.ValidationError({"detail": "Exam not allowed"})
+
+        session, _ = ExamSession.objects.get_or_create(
+            student=user,
+            exam=exam,
+            defaults={"is_completed": False},
+        )
+
+        return session
 
 # ================= ANSWER ================= #
 

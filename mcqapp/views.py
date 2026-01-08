@@ -1,10 +1,13 @@
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.conf import settings
 from django.core.mail import send_mail
 from django.contrib.auth import authenticate, get_user_model
 from django.db import IntegrityError, transaction
+from rest_framework.filters import SearchFilter
 
+import openpyxl
 from rest_framework import viewsets, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -55,52 +58,8 @@ class StudentViewSet(viewsets.ModelViewSet):
         )
         subjects = [e.subject for e in enrollments]
         return Response(SubjectSerializer(subjects, many=True).data)
-
-
-class StudentSubjectEnrollmentViewSet(viewsets.ModelViewSet):
-    queryset = StudentSubjectEnrollment.objects.all()
-    serializer_class = StudentSubjectEnrollmentSerializer
-    authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated, IsAdminUserOnly]
-
-    @action(detail=False, methods=['POST'])
-    def bulk_enroll(self, request):
-        subject_id = request.data.get('subject_id')
-        student_ids = request.data.get('student_ids', [])
-
-        created = []
-        for sid in student_ids:
-            obj, _ = StudentSubjectEnrollment.objects.update_or_create(
-                student_id=sid,
-                subject_id=subject_id,
-                defaults={'is_active': True}
-            )
-            created.append(obj.id)
-
-        return Response({
-            'status': 'bulk_enroll_success',
-            'count': len(created)
-        })
-
-    @action(detail=False, methods=['POST'])
-    def bulk_assign_subjects(self, request):
-        student_id = request.data.get('student_id')
-        subject_ids = request.data.get('subject_ids', [])
-
-        created = []
-        for sub_id in subject_ids:
-            obj, _ = StudentSubjectEnrollment.objects.update_or_create(
-                student_id=student_id,
-                subject_id=sub_id,
-                defaults={'is_active': True}
-            )
-            created.append(obj.id)
-
-        return Response({
-            'status': 'bulk_assign_success',
-            'count': len(created)
-        })
-        
+    
+    
 # ======================================================
 # AUTH
 # ======================================================
@@ -121,8 +80,7 @@ class LoginView(APIView):
 
         return Response({
             'token': token.key,
-            'first_name': user.first_name,
-            'last_name': user.last_name,
+            'full_name': user.first_name + ' ' + user.last_name,
             'role': user.user_type,
             'email': user.email,
             'force_password_change': user.force_password_change,
@@ -209,7 +167,6 @@ class SubjectViewSet(viewsets.ModelViewSet):
             )
         return Subject.objects.all()
 
-
 # ======================================================
 # QUESTION
 # ======================================================
@@ -218,15 +175,85 @@ class QuestionViewSet(viewsets.ModelViewSet):
     serializer_class = QuestionSerializer
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
+    filter_backends = [SearchFilter]
+    search_fields = ["text"]
 
     def get_queryset(self):
-        if self.request.user.user_type == 'student':
-            return Question.objects.filter(
-                subject__studentsubjectenrollment__student=self.request.user,
-                subject__studentsubjectenrollment__is_active=True
-            )
-        return Question.objects.all()
+        qs = Question.objects.all()
+        subject_id = self.request.query_params.get("subject")
+        if subject_id:
+            qs = qs.filter(subject_id=subject_id)
+        return qs.order_by("-id")
 
+    # ================= BULK UPLOAD =================
+    @action(detail=False, methods=["POST"], url_path="upload-excel")
+    def upload_excel(self, request):
+        file = request.FILES.get("file")
+        subject_id = request.data.get("subject")
+
+        if not file or not subject_id:
+            return Response(
+                {"error": "file and subject are required"}, status=400
+            )
+
+        wb = openpyxl.load_workbook(file)
+        sheet = wb.active
+        created = 0
+
+        for row in sheet.iter_rows(min_row=2, values_only=True):
+            (
+                text,
+                option_a,
+                option_b,
+                option_c,
+                option_d,
+                correct_option,
+                marks,
+                explanation,
+            ) = row
+
+            if not text:
+                continue
+
+            Question.objects.update_or_create(
+                subject_id=subject_id,
+                text=text,
+                defaults={
+                    "option_a": option_a,
+                    "option_b": option_b,
+                    "option_c": option_c,
+                    "option_d": option_d,
+                    "correct_option": correct_option,
+                    "marks": marks or 1,
+                    "explanation": explanation or "",
+                },
+            )
+            created += 1
+
+        return Response({"status": "success", "created": created})
+
+    # ================= EXCEL TEMPLATE DOWNLOAD =================
+    @action(detail=False, methods=["GET"], url_path="download-template")
+    def download_template(self, request):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append([
+            "text",
+            "option_a",
+            "option_b",
+            "option_c",
+            "option_d",
+            "correct_option",
+            "marks",
+            "explanation",
+        ])
+
+        response = HttpResponse(
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        response["Content-Disposition"] = 'attachment; filename="mcq_template.xlsx"'
+        wb.save(response)
+        return response
 
 # ======================================================
 # EXAM (MCQ ONLY)
@@ -238,32 +265,51 @@ class ExamViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        if self.request.user.user_type == 'student':
-            return Exam.objects.filter(
-                subject__studentsubjectenrollment__student=self.request.user,
-                subject__studentsubjectenrollment__is_active=True,
-                is_published=True
-            )
-        return Exam.objects.all()
+        user = self.request.user
 
-    @action(detail=True, methods=['POST'])
+        qs = (
+            Exam.objects
+            .select_related("subject")
+            .prefetch_related("questions")
+            .order_by("-created_at")
+        )
+
+        # STUDENT: published + enrolled subjects only
+        if user.user_type == "student":
+            enrolled_subjects = Subject.objects.filter(
+                studentsubjectenrollment__student=user,
+                studentsubjectenrollment__is_active=True
+            )
+            qs = qs.filter(
+                is_published=True,
+                subject__in=enrolled_subjects
+            )
+
+        subject_id = self.request.query_params.get("subject")
+        if subject_id:
+            qs = qs.filter(subject_id=subject_id)
+
+        return qs
+
+
+    @action(detail=True, methods=["post"])
     def publish(self, request, pk=None):
         exam = self.get_object()
         exam.is_published = True
         exam.save()
-        return Response({'status': 'published'})
+        return Response({"published": True})
 
-    @action(detail=True, methods=['POST'])
+    @action(detail=True, methods=["post"])
     def unpublish(self, request, pk=None):
         exam = self.get_object()
         exam.is_published = False
         exam.save()
-        return Response({'status': 'unpublished'})
-
-
+        return Response({"published": False})
+    
 # ======================================================
 # EXAM SESSION
 # ======================================================
+    
 
 class ExamSessionViewSet(viewsets.ModelViewSet):
     serializer_class = ExamSessionSerializer
@@ -271,62 +317,57 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        if self.request.user.user_type == 'student':
-            return ExamSession.objects.filter(student=self.request.user)
+        user = self.request.user
+        if user.user_type == "student":
+            return ExamSession.objects.filter(student=user)
         return ExamSession.objects.all()
 
-    @action(detail=True, methods=['POST'])
-    def start_exam(self, request, pk=None):
-        session = self.get_object()
-        session.start_time = timezone.now()
-        session.save()
-        return Response({'status': 'started'})
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(
+            data=request.data,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        session = serializer.save()
+        return Response(self.get_serializer(session).data, status=201)
 
-    @action(detail=True, methods=['POST'])
-    def submit_exam(self, request, pk=None):
+    @action(detail=True, methods=["post"])
+    def submit(self, request, pk=None):
         session = self.get_object()
 
         if session.student != request.user:
             raise PermissionDenied()
 
-        answers = request.data.get('answers', [])
+        if session.is_completed:
+            return Response({"error": "Already submitted"}, status=400)
+
+        answers = request.data.get("answers", [])
         Answer.objects.filter(session=session).delete()
 
-        score = 0
-        total = 0
-
+        score = total = 0
         for a in answers:
-            q = Question.objects.get(id=a['question'])
+            q = Question.objects.get(id=a["question"])
             total += q.marks
-            if a['selected_answers'] == q.correct_option:
+            if a["selected_answers"] == q.correct_option:
                 score += q.marks
+
             Answer.objects.create(
                 session=session,
                 question=q,
-                selected_answers=a['selected_answers']
+                selected_answers=a["selected_answers"],
             )
 
         Result.objects.create(
             session=session,
             score=score,
-            total_marks=total
+            total_marks=total,
         )
 
         session.is_completed = True
         session.end_time = timezone.now()
         session.save()
 
-        return Response({'score': score, 'total': total})
-
-    @action(detail=False, methods=['GET'], url_path='validate/(?P<exam_id>[^/.]+)')
-    def validate_session(self, request, exam_id=None):
-        exists = ExamSession.objects.filter(
-            student=request.user,
-            exam_id=exam_id,
-            is_completed=False
-        ).exists()
-        return Response({'valid': exists})
-
+        return Response({"score": score, "total": total})
 
 # ======================================================
 # ANSWER

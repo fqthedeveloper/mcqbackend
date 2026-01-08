@@ -3,7 +3,7 @@ from rest_framework import routers
 from .views import (
     UserViewSet, SubjectViewSet, QuestionViewSet,
     ExamViewSet, ExamSessionViewSet, AnswerViewSet,
-    ResultViewSet, StudentViewSet, StudentSubjectEnrollmentViewSet,
+    ResultViewSet, StudentViewSet,
     SendOTPView, LoginView, ForcePasswordChangeView, VerifyOTPView,
     StudentDashboardView, AdminDashboardView, MyProfileView
 )
@@ -17,7 +17,6 @@ router.register(r'sessions', ExamSessionViewSet, basename='session')
 router.register(r'answers', AnswerViewSet, basename='answer')
 router.register(r'results', ResultViewSet, basename='result')
 router.register(r'students', StudentViewSet, basename='student')
-router.register(r'enrollments', StudentSubjectEnrollmentViewSet, basename='enrollment')
 
 urlpatterns = [
     path('', include(router.urls)),
@@ -36,11 +35,4 @@ urlpatterns = [
     # Exam actions
     path('exams/<int:pk>/publish/', ExamViewSet.as_view({'post': 'publish'})),
     path('exams/<int:pk>/unpublish/', ExamViewSet.as_view({'post': 'unpublish'})),
-    path('sessions/<int:pk>/start/', ExamSessionViewSet.as_view({'post': 'start_exam'})),
-    path('sessions/<int:pk>/submit/', ExamSessionViewSet.as_view({'post': 'submit_exam'})),
-    path('sessions/validate/<int:exam_id>/', ExamSessionViewSet.as_view({'get': 'validate_session'})),
-
-    # Bulk
-    path('enrollments/bulk-enroll/', StudentSubjectEnrollmentViewSet.as_view({'post': 'bulk_enroll'})),
-    path('enrollments/bulk-assign/', StudentSubjectEnrollmentViewSet.as_view({'post': 'bulk_assign_subjects'})),
 ]

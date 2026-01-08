@@ -13,7 +13,15 @@ class UserAdmin(BaseUserAdmin):
         ('Personal info', {'fields': ('first_name', 'last_name')}),
         ('User Type', {'fields': ('user_type',)}),
         ('Force Password Change', {'fields': ('force_password_change',)}),
-        ('Permissions', {'fields': ('is_active', 'is_staff', 'is_superuser', 'groups', 'user_permissions')}),
+        ('Permissions', {
+            'fields': (
+                'is_active',
+                'is_staff',
+                'is_superuser',
+                'groups',
+                'user_permissions'
+            )
+        }),
         ('Important dates', {'fields': ('last_login', 'date_joined')}),
     )
 
@@ -50,8 +58,26 @@ class ResultAdmin(admin.ModelAdmin):
     list_display = ('session', 'score', 'total_marks', 'created_at')
 
 
+# ✅ SUBJECT ADMIN WITH QUESTION COUNT
+@admin.register(Subject)
+class SubjectAdmin(admin.ModelAdmin):
+    list_display = (
+        'name',
+        'description',
+        'is_active',
+        'question_count',
+    )
+    list_filter = ('is_active',)
+    search_fields = ('name',)
+
+    def question_count(self, obj):
+        return obj.question_set.count()
+
+    question_count.short_description = "Questions"
+
+
+# ✅ REGISTER OTHERS (ONLY ONCE)
 admin.site.register(User, UserAdmin)
-admin.site.register(Subject)
 admin.site.register(StudentSubjectEnrollment, StudentSubjectEnrollmentAdmin)
 admin.site.register(Question, QuestionAdmin)
 admin.site.register(Exam, ExamAdmin)
