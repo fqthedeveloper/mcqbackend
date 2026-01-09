@@ -107,6 +107,12 @@ class Exam(models.Model):
 
 
 class ExamSession(models.Model):
+    TERMINATE_CHOICES = (
+        ("time_up", "Time Up"),
+        ("warnings", "Warnings Limit"),
+        ("manual", "Manual Submit"),
+    )
+
     student = models.ForeignKey(User, on_delete=models.CASCADE)
     exam = models.ForeignKey(Exam, on_delete=models.CASCADE)
 
@@ -114,8 +120,15 @@ class ExamSession(models.Model):
     end_time = models.DateTimeField(null=True, blank=True)
     is_completed = models.BooleanField(default=False)
 
+    terminate_reason = models.CharField(
+        max_length=20,
+        choices=TERMINATE_CHOICES,
+        null=True,
+        blank=True,
+    )
+
     class Meta:
-        unique_together = ('student', 'exam')
+        unique_together = ("student", "exam")
 
     def __str__(self):
         return f"{self.student} - {self.exam}"

@@ -11,6 +11,7 @@ from .models import (
     User, Subject, StudentSubjectEnrollment,
     Question, Exam, ExamSession, Answer, Result
 )
+from .models import *
 
 User = get_user_model()
 
@@ -367,7 +368,95 @@ class AnswerSerializer(serializers.ModelSerializer):
 
 # ================= RESULT ================= #
 
+class QuestionResultSerializer(serializers.Serializer):
+    question_id = serializers.IntegerField()
+    question_text = serializers.CharField()
+    correct_answer = serializers.ListField(child=serializers.CharField())
+    selected_answer = serializers.ListField(child=serializers.CharField())
+    is_correct = serializers.BooleanField()
+    marks = serializers.IntegerField()
+    earned = serializers.IntegerField()
+    explanation = serializers.CharField(allow_null=True)
+
+
 class ResultSerializer(serializers.ModelSerializer):
+    exam_title = serializers.CharField(source="session.exam.title", read_only=True)
+    student_name = serializers.CharField(source="session.student.get_full_name", read_only=True)
+    student_email = serializers.EmailField(source="session.student.email", read_only=True)
+    student_id = serializers.IntegerField(source="session.student.id", read_only=True)
+
+    session_id = serializers.IntegerField(source="session.id", read_only=True)
+    submitted_at = serializers.DateTimeField(source="session.end_time", read_only=True)
+    date = serializers.DateTimeField(source="session.end_time", read_only=True)
+
+    pass_fail = serializers.SerializerMethodField()
+    right_answers = serializers.SerializerMethodField()
+    wrong_answers = serializers.SerializerMethodField()
+    details = serializers.SerializerMethodField()
+
     class Meta:
         model = Result
-        fields = ['id', 'session', 'score', 'total_marks']
+        fields = [
+            "id",
+            "session_id",
+            "exam_title",
+
+            # student info (admin sees all, student sees self)
+            "student_id",
+            "student_name",
+            "student_email",
+
+            "score",
+            "total_marks",
+            "submitted_at",
+            "date",
+
+            "right_answers",
+            "wrong_answers",
+            "pass_fail",
+
+            "details",
+        ]
+
+    def get_pass_fail(self, obj):
+        if obj.total_marks == 0:
+            return "Fail"
+        percent = (obj.score / obj.total_marks) * 100
+        return "Pass" if percent >= 80 else "Fail"
+
+    def get_right_answers(self, obj):
+        return Answer.objects.filter(
+            session=obj.session,
+            question__correct_option=models.F("selected_answers")
+        ).count()
+
+    def get_wrong_answers(self, obj):
+        total = Answer.objects.filter(session=obj.session).count()
+        return total - self.get_right_answers(obj)
+
+    def get_details(self, obj):
+        answers = Answer.objects.filter(
+            session=obj.session
+        ).select_related("question")
+
+        data = {}
+        for ans in answers:
+            q = ans.question
+
+            correct = q.correct_option if isinstance(q.correct_option, list) else [q.correct_option]
+            selected = ans.selected_answers if isinstance(ans.selected_answers, list) else [ans.selected_answers]
+
+            is_correct = set(correct) == set(selected)
+            earned = q.marks if is_correct else 0
+
+            data[str(q.id)] = {
+                "question_text": q.text,
+                "correct": correct,
+                "selected": selected,
+                "is_correct": is_correct,
+                "marks": q.marks,
+                "earned": earned,
+                "explanation": None if is_correct else q.explanation,
+            }
+
+        return data

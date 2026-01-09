@@ -339,15 +339,18 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
             raise PermissionDenied()
 
         if session.is_completed:
-            return Response({"error": "Already submitted"}, status=400)
+            return Response({"detail": "Already submitted"}, status=400)
 
         answers = request.data.get("answers", [])
+        terminate_reason = request.data.get("terminate_reason", "manual")
+
         Answer.objects.filter(session=session).delete()
 
         score = total = 0
         for a in answers:
             q = Question.objects.get(id=a["question"])
             total += q.marks
+
             if a["selected_answers"] == q.correct_option:
                 score += q.marks
 
@@ -365,9 +368,14 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
 
         session.is_completed = True
         session.end_time = timezone.now()
+        session.terminate_reason = terminate_reason
         session.save()
 
-        return Response({"score": score, "total": total})
+        return Response({
+            "score": score,
+            "total": total,
+            "terminate_reason": terminate_reason,
+        })
 
 # ======================================================
 # ANSWER
@@ -390,9 +398,41 @@ class ResultViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        if self.request.user.user_type == 'student':
-            return Result.objects.filter(session__student=self.request.user)
-        return Result.objects.all()
+        user = self.request.user
+
+        # ✅ STUDENT → only own results
+        if user.user_type == "student":
+            return Result.objects.filter(session__student=user)
+
+        # ✅ ADMIN → all students
+        return Result.objects.select_related(
+            "session__student",
+            "session__exam"
+        )
+
+    # ✅ DETAIL BY SESSION (ADMIN + STUDENT SAFE)
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path=r"session/(?P<session_id>[^/.]+)"
+    )
+    def by_session(self, request, session_id=None):
+        user = request.user
+
+        if user.user_type == "student":
+            result = get_object_or_404(
+                Result,
+                session__id=session_id,
+                session__student=user
+            )
+        else:
+            result = get_object_or_404(
+                Result,
+                session__id=session_id
+            )
+
+        serializer = self.get_serializer(result)
+        return Response(serializer.data)
 
 
 # ======================================================
