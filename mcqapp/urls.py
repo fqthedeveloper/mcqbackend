@@ -1,9 +1,9 @@
 from django.urls import path, include
 from rest_framework import routers
 from .views import (
-    UserViewSet, SubjectViewSet, QuestionViewSet,
+    ResetPasswordView, UserViewSet, SubjectViewSet, QuestionViewSet,
     ExamViewSet, ExamSessionViewSet, AnswerViewSet,
-    ResultViewSet, StudentViewSet,
+    ResultViewSet, StudentViewSet, ForgotPasswordView,
     SendOTPView, LoginView, ForcePasswordChangeView, VerifyOTPView,
     StudentDashboardView, AdminDashboardView, MyProfileView
 )
@@ -24,8 +24,10 @@ urlpatterns = [
     # Auth
     path('login/', LoginView.as_view(), name='login'),
     path('change-password/', ForcePasswordChangeView.as_view(), name='change-password'),
-    path('send-otp/', SendOTPView.as_view(), name='send-otp'),
-    path('verify-otp/', VerifyOTPView.as_view(), name='verify-otp'),
+    path("forgot-password/", ForgotPasswordView.as_view()),
+    path("reset-password/", ResetPasswordView.as_view()),
+    path("send-otp/", SendOTPView.as_view(), name="send-otp"),
+    path("verify-otp/", VerifyOTPView.as_view(), name="verify-otp"),
 
     # Dashboard
     path('student-dashboard/', StudentDashboardView.as_view(), name='student-dashboard'),

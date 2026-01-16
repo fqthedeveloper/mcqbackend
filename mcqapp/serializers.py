@@ -151,6 +151,23 @@ class PasswordChangeSerializer(serializers.Serializer):
         return data
 
 
+class ForgotPasswordSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+
+class ResetPasswordSerializer(serializers.Serializer):
+    token = serializers.UUIDField()
+    new_password = serializers.CharField(min_length=8)
+    
+    
+class SendOTPSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+
+class VerifyOTPSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    otp = serializers.CharField(max_length=6)
+
 # ================= SUBJECT ================= #
 
 class SubjectSerializer(serializers.ModelSerializer):

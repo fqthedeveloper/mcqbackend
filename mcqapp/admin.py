@@ -13,6 +13,7 @@ class UserAdmin(BaseUserAdmin):
         ('Personal info', {'fields': ('first_name', 'last_name')}),
         ('User Type', {'fields': ('user_type',)}),
         ('Force Password Change', {'fields': ('force_password_change',)}),
+        ('User Email Verified', {'fields': ('is_verified',)}),
         ('Permissions', {
             'fields': (
                 'is_active',

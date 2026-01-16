@@ -16,6 +16,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.authtoken.models import Token
 from rest_framework.exceptions import PermissionDenied
+from .utils import generate_otp
 
 import random
 
@@ -103,52 +104,160 @@ class ForcePasswordChangeView(APIView):
         return Response({'message': 'Password changed'})
 
 
+class ForgotPasswordView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = ForgotPasswordSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        email = serializer.validated_data["email"]
+
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            return Response({"message": "If email exists, reset link sent"})
+
+        # ❌ ADMIN BLOCK
+        if user.user_type == "admin":
+            return Response(
+                {"error": "Admin password reset not allowed"},
+                status=403
+            )
+
+        token_obj = PasswordResetToken.objects.create(user=user)
+
+        reset_link = f"http://localhost:3000/reset-password/{token_obj.token}"
+
+        send_mail(
+            subject="Reset Your Password",
+            message=f"Click the link to reset your password:\n\n{reset_link}\n\nLink valid for 30 minutes.",
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email],
+            fail_silently=False,
+        )
+
+        return Response({"message": "Password reset link sent"})
+
+
+class ResetPasswordView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = ResetPasswordSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        token = serializer.validated_data["token"]
+        new_password = serializer.validated_data["new_password"]
+
+        try:
+            token_obj = PasswordResetToken.objects.get(token=token, is_used=False)
+        except PasswordResetToken.DoesNotExist:
+            return Response({"error": "Invalid reset link"}, status=400)
+
+        if token_obj.is_expired():
+            token_obj.delete()
+            return Response({"error": "Reset link expired"}, status=400)
+
+        user = token_obj.user
+
+        if user.user_type == "admin":
+            return Response(
+                {"error": "Admin password reset not allowed"},
+                status=403
+            )
+
+        user.set_password(new_password)
+        user.force_password_change = False
+        user.save()
+
+        token_obj.is_used = True
+        token_obj.save()
+
+        return Response({"message": "Password reset successful"})
+    
 # ======================================================
 # OTP
 # ======================================================
 
-def generate_otp():
-    return str(random.randint(100000, 999999))
-
-
 class SendOTPView(APIView):
-    permission_classes = [IsAuthenticated]
     authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
 
     def post(self, request):
+        serializer = SendOTPSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        email = serializer.validated_data["email"]
+
+        if email != request.user.email:
+            return Response(
+                {"error": "Email does not match logged-in user"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         otp = generate_otp()
 
         EmailOTP.objects.update_or_create(
             user=request.user,
-            defaults={'otp': otp}
+            defaults={"otp": otp}
         )
 
         send_mail(
-            'Your OTP',
-            f'Your OTP is {otp}',
-            settings.DEFAULT_FROM_EMAIL,
-            [request.user.email]
+            subject="Your Email Verification OTP",
+            message=f"Your OTP is {otp}. It is valid for 10 minutes.",
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email],
+            fail_silently=False
         )
 
-        return Response({'message': 'OTP sent'})
+        return Response(
+            {"message": "OTP sent to your email"},
+            status=status.HTTP_200_OK
+        )
 
 
 class VerifyOTPView(APIView):
-    permission_classes = [IsAuthenticated]
     authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
 
     def post(self, request):
+        serializer = VerifyOTPSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        otp = serializer.validated_data["otp"]
+        email = serializer.validated_data["email"]
+
+        if email != request.user.email:
+            return Response(
+                {"error": "Email does not match logged-in user"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         record = get_object_or_404(EmailOTP, user=request.user)
 
-        if record.otp != request.data.get('otp'):
-            return Response({'error': 'Invalid OTP'}, status=400)
+        if record.is_expired():
+            record.delete()
+            return Response(
+                {"error": "OTP expired"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if record.otp != otp:
+            return Response(
+                {"error": "Invalid OTP"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         request.user.is_verified = True
-        request.user.save()
+        request.user.save(update_fields=["is_verified"])
+
         record.delete()
 
-        return Response({'message': 'Verified'})
-
+        return Response(
+            {"message": "Email verified successfully"},
+            status=status.HTTP_200_OK
+        )
 
 # ======================================================
 # SUBJECT
@@ -331,24 +440,55 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
         session = serializer.save()
         return Response(self.get_serializer(session).data, status=201)
 
+    # 🔒 ABSOLUTELY SAFE SUBMIT
     @action(detail=True, methods=["post"])
+    @transaction.atomic
     def submit(self, request, pk=None):
-        session = self.get_object()
+        session = (
+            ExamSession.objects
+            .select_for_update()
+            .select_related("exam")
+            .get(pk=pk)
+        )
 
         if session.student != request.user:
-            raise PermissionDenied()
+            raise PermissionDenied("Not allowed")
 
+        # 🔥 HARD STOP — NO SECOND SUBMIT
         if session.is_completed:
-            return Response({"detail": "Already submitted"}, status=400)
+            return Response(
+                {"detail": "Exam already submitted"},
+                status=400
+            )
 
         answers = request.data.get("answers", [])
         terminate_reason = request.data.get("terminate_reason", "manual")
 
+        if terminate_reason not in dict(ExamSession.TERMINATE_CHOICES):
+            terminate_reason = "manual"
+
+        # 🔥 LOCK EXAM FIRST (IMPORTANT)
+        session.is_completed = True
+        session.end_time = timezone.now()
+        session.terminate_reason = terminate_reason
+        session.save(update_fields=[
+            "is_completed",
+            "end_time",
+            "terminate_reason"
+        ])
+
+        # 🔥 DELETE OLD ANSWERS (SAFETY)
         Answer.objects.filter(session=session).delete()
 
-        score = total = 0
+        score = 0
+        total = 0
+
         for a in answers:
-            q = Question.objects.get(id=a["question"])
+            try:
+                q = Question.objects.get(id=a["question"])
+            except Question.DoesNotExist:
+                continue
+
             total += q.marks
 
             if a["selected_answers"] == q.correct_option:
@@ -365,11 +505,6 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
             score=score,
             total_marks=total,
         )
-
-        session.is_completed = True
-        session.end_time = timezone.now()
-        session.terminate_reason = terminate_reason
-        session.save()
 
         return Response({
             "score": score,
