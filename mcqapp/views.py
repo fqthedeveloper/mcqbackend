@@ -192,7 +192,7 @@ class SendOTPView(APIView):
 
         if email != request.user.email:
             return Response(
-                {"error": "Email does not match logged-in user"},
+                {"error": "Email mismatch"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -204,15 +204,15 @@ class SendOTPView(APIView):
         )
 
         send_mail(
-            subject="Your Email Verification OTP",
-            message=f"Your OTP is {otp}. It is valid for 10 minutes.",
+            subject="IRT MCQ Email Verification OTP",
+            message=f"Your IRT MCQ Email Verification OTP is {otp}",
             from_email=settings.DEFAULT_FROM_EMAIL,
             recipient_list=[email],
             fail_silently=False
         )
 
         return Response(
-            {"message": "OTP sent to your email"},
+            {"success": True, "message": "OTP sent"},
             status=status.HTTP_200_OK
         )
 
@@ -225,16 +225,22 @@ class VerifyOTPView(APIView):
         serializer = VerifyOTPSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        otp = serializer.validated_data["otp"]
         email = serializer.validated_data["email"]
+        otp = serializer.validated_data["otp"].strip()
 
         if email != request.user.email:
             return Response(
-                {"error": "Email does not match logged-in user"},
+                {"error": "Email mismatch"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        record = get_object_or_404(EmailOTP, user=request.user)
+        record = EmailOTP.objects.filter(user=request.user).first()
+
+        if not record:
+            return Response(
+                {"error": "OTP not found"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         if record.is_expired():
             record.delete()
@@ -243,7 +249,7 @@ class VerifyOTPView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        if record.otp != otp:
+        if record.otp.strip() != otp:
             return Response(
                 {"error": "Invalid OTP"},
                 status=status.HTTP_400_BAD_REQUEST
@@ -255,7 +261,7 @@ class VerifyOTPView(APIView):
         record.delete()
 
         return Response(
-            {"message": "Email verified successfully"},
+            {"success": True, "message": "OTP verified"},
             status=status.HTTP_200_OK
         )
 
