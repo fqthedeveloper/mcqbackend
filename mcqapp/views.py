@@ -624,8 +624,39 @@ class AdminDashboardView(APIView):
 
 
 class MyProfileView(APIView):
-    permission_classes = [IsAuthenticated]
     authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        return Response(UserSerializer(request.user).data)
+        user = request.user
+
+        # IMPORTANT: decide verification source
+        # If you use Django default email verification
+        # adjust this logic if needed
+        is_verified = getattr(user, "is_verified", False)
+
+        return Response({
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "is_verified": is_verified,
+        }, status=status.HTTP_200_OK)
+
+    def put(self, request):
+        user = request.user
+
+        user.first_name = request.data.get("first_name", user.first_name)
+        user.last_name = request.data.get("last_name", user.last_name)
+        user.email = request.data.get("email", user.email)
+
+        user.save()
+
+        return Response({
+            "username": user.username,
+            "email": user.email,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "is_verified": getattr(user, "is_verified", False),
+        }, status=status.HTTP_200_OK)

@@ -39,7 +39,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'mcqapp',
-    # 'practicalapp',
+    'practicalapp',
     'rest_framework',
     'rest_framework.authtoken',
     'corsheaders',
@@ -87,7 +87,7 @@ import os
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'NAME': BASE_DIR / 'db_backup.sqlite3',
     }
 }
 
