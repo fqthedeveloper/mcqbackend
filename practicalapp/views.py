@@ -3,113 +3,155 @@ from rest_framework.permissions import IsAuthenticated, IsAdminUser
 from rest_framework.response import Response
 from django.utils import timezone
 from rest_framework import status
-
+from mcqapp.models import StudentSubjectEnrollment
+from django.db import transaction
 from .models import PracticalTask, PracticalSession
-from .services import start_vm, verify_vm, destroy_vm
 from .serializers import PracticalTaskSerializer
+from .services import start_vm, verify_vm, destroy_vm
 from mcqapp.models import Subject
 
 
-# ================================
-# ADMIN: LIST + CREATE
-# ================================
+# ================= ADMIN =================
+
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated, IsAdminUser])
-def practical_task_list_create(request):
+def admin_practical_list_create(request):
     if request.method == "GET":
-        tasks = PracticalTask.objects.select_related("subject").all().order_by("-id")
-        serializer = PracticalTaskSerializer(tasks, many=True)
-        return Response(serializer.data)
+        tasks = PracticalTask.objects.select_related("subject").all()
+        return Response(PracticalTaskSerializer(tasks, many=True).data)
 
-    if request.method == "POST":
-        serializer = PracticalTaskSerializer(data=request.data)
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    serializer = PracticalTaskSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    serializer.save()
+    return Response(serializer.data, status=201)
 
 
-# ================================
-# ADMIN: UPDATE
-# ================================
 @api_view(["PUT"])
 @permission_classes([IsAuthenticated, IsAdminUser])
-def practical_task_update(request, pk):
-    try:
-        task = PracticalTask.objects.get(pk=pk)
-    except PracticalTask.DoesNotExist:
-        return Response({"detail": "Not found"}, status=404)
-
+def admin_practical_update(request, pk):
+    task = PracticalTask.objects.get(pk=pk)
     serializer = PracticalTaskSerializer(task, data=request.data)
-    if serializer.is_valid():
-        serializer.save()
-        return Response(serializer.data)
-    return Response(serializer.errors, status=400)
+    serializer.is_valid(raise_exception=True)
+    serializer.save()
+    return Response(serializer.data)
+
+
+# ================= STUDENT =================
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def student_practical_list(request):
+    user = request.user
+
+    if user.user_type != "student":
+        return Response({"detail": "Forbidden"}, status=403)
+
+    # ================= GET STUDENT SUBJECTS (CORRECT WAY) =================
+    subject_ids = StudentSubjectEnrollment.objects.filter(
+        student=user,
+        is_active=True
+    ).values_list("subject_id", flat=True)
+
+    if not subject_ids.exists():
+        # Student is not enrolled in any subject
+        return Response([])
+
+    # ================= GET PRACTICAL TASKS =================
+    tasks = PracticalTask.objects.filter(
+        subject_id__in=subject_ids,
+        is_active=True,
+        is_published=True
+    ).select_related("subject")
+
+    data = []
+    for task in tasks:
+        session = PracticalSession.objects.filter(
+            user=user,
+            task=task
+        ).order_by("-id").first()
+
+        data.append({
+            "task_id": task.id,
+            "title": task.title,
+            "subject": task.subject.name,
+            "duration": task.duration_minutes,
+            "status": session.status if session else "not_started"
+        })
+
+    return Response(data)
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
-def available_practicals(request):
-    if request.user.user_type != "student":
-        return Response({"detail": "Forbidden"}, status=403)
-
-    subjects = Subject.objects.filter(is_active=True)
-
-    tasks = PracticalTask.objects.filter(
-        subject__in=subjects,
-        is_published=True,
-        is_active=True,
-    )
-
-    serializer = PracticalTaskSerializer(tasks, many=True)
-    return Response(serializer.data)
+def student_practical_detail(request, pk):
+    task = PracticalTask.objects.get(pk=pk)
+    return Response(PracticalTaskSerializer(task).data)
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
-def start_practical(request):
-    if request.user.user_type != "student":
-        return Response({"detail": "Forbidden"}, status=403)
+def student_practical_start(request, pk):
+    user = request.user
 
-    task_id = request.data.get("task_id")
+    with transaction.atomic():
+        if PracticalSession.objects.select_for_update().filter(
+            user=user, status="running"
+        ).exists():
+            return Response(
+                {"error": "Another practical already running"},
+                status=400
+            )
 
-    try:
         task = PracticalTask.objects.get(
-            id=task_id, is_published=True, is_active=True
+            pk=pk,
+            is_active=True,
+            is_published=True
         )
-    except PracticalTask.DoesNotExist:
-        return Response({"error": "Practical not available"}, status=404)
 
-    if PracticalSession.objects.filter(user=request.user, status="running").exists():
-        return Response({"error": "Already running"}, status=400)
+        # TEMP VM NAME (will be overwritten)
+        session = PracticalSession.objects.create(
+            user=user,
+            task=task,
+            vm_name=f"pending-{user.id}-{pk}",
+            status="starting"
+        )
 
-    vm_data = start_vm(task.snapshot_name, request.user.email)
+    # VM START (OUTSIDE TRANSACTION)
+    vm = start_vm(task.snapshot_name, user.email)
 
-    session = PracticalSession.objects.create(
-        user=request.user,
-        task=task,
-        vm_name=vm_data["vm_name"],
-        vm_ip=vm_data["vm_ip"],
-    )
+    session.vm_name = vm["vm_name"]
+    session.vm_ip = vm["vm_ip"]
+    session.status = "running"
+    session.save()
 
-    return Response(
-        {
-            "task": task.title,
-            "subject": task.subject.name,
-            "vm_ip": session.vm_ip,
-            "ssh_user": "student",
-            "ssh_password": "student",
-            "time_minutes": task.duration_minutes,
-        }
-    )
+    return Response({
+        "session_id": session.id,
+        "vm_ip": session.vm_ip,
+        "duration": task.duration_minutes
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def practical_session_detail(request, pk):
+    session = PracticalSession.objects.get(pk=pk, user=request.user)
+
+    return Response({
+        "id": session.id,
+        "task_id": session.task.id,
+        "title": session.task.title,
+        "description": session.task.description,
+        "duration": session.task.duration_minutes,
+        "start_time": session.start_time,
+        "status": session.status,
+        "vm_ip": session.vm_ip,
+    })
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
-def submit_practical(request):
-    session = PracticalSession.objects.get(
-        user=request.user, status="running"
-    )
+def practical_session_submit(request, pk):
+    session = PracticalSession.objects.get(pk=pk, user=request.user, status="running")
 
     result = verify_vm(
         session.vm_ip,
@@ -117,9 +159,7 @@ def submit_practical(request):
         session.task.expected_output,
     )
 
-    session.obtained_marks = (
-        session.task.total_marks if result["success"] else 0
-    )
+    session.obtained_marks = session.task.total_marks if result["success"] else 0
     session.calculate_percentage()
     session.status = "submitted"
     session.end_time = timezone.now()
@@ -127,10 +167,8 @@ def submit_practical(request):
 
     destroy_vm(session.vm_name)
 
-    return Response(
-        {
-            "marks": session.obtained_marks,
-            "total_marks": session.task.total_marks,
-            "percentage": session.percentage,
-        }
-    )
+    return Response({
+        "marks": session.obtained_marks,
+        "total_marks": session.task.total_marks,
+        "percentage": session.percentage,
+    })

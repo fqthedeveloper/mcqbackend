@@ -1,16 +1,18 @@
 from django.urls import path
-from .views import (
-    available_practicals, start_practical, submit_practical, practical_task_list_create, practical_task_update 
-
-)
-
+from . import views
 
 urlpatterns = [
-     # ADMIN CRUD
-    path("tasks/", practical_task_list_create),
-    path("tasks/<int:pk>/", practical_task_update),
-    
-    path("available/", available_practicals),
-    path("start/", start_practical),
-    path("submit/", submit_practical),
+
+    # ADMIN
+    path("tasks/", views.admin_practical_list_create),
+    path("tasks/<int:pk>/", views.admin_practical_update),
+
+    # STUDENT
+    path("student-exams/", views.student_practical_list),
+    path("student-exams/<int:pk>/detail/", views.student_practical_detail),
+    path("student-exams/<int:pk>/start/", views.student_practical_start),
+
+    # SESSION
+    path("sessions/<int:pk>/", views.practical_session_detail),
+    path("sessions/<int:pk>/submit/", views.practical_session_submit),
 ]

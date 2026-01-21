@@ -17,6 +17,7 @@ class PracticalTask(models.Model):
     )
 
     snapshot_name = models.CharField(max_length=100)
+
     verify_command = models.TextField()
     expected_output = models.CharField(max_length=200)
 
@@ -29,11 +30,12 @@ class PracticalTask(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return f"{self.title} ({self.subject.name})"
+        return self.title
 
 
 class PracticalSession(models.Model):
     STATUS_CHOICES = (
+        ("starting", "Starting"),
         ("running", "Running"),
         ("submitted", "Submitted"),
         ("expired", "Expired"),
@@ -43,8 +45,8 @@ class PracticalSession(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE)
     task = models.ForeignKey(PracticalTask, on_delete=models.CASCADE)
 
-    vm_name = models.CharField(max_length=120, unique=True)
-    vm_ip = models.GenericIPAddressField()
+    vm_name = models.CharField(max_length=150, unique=True)
+    vm_ip = models.GenericIPAddressField(null=True, blank=True)
 
     start_time = models.DateTimeField(default=timezone.now)
     end_time = models.DateTimeField(null=True, blank=True)
@@ -53,7 +55,9 @@ class PracticalSession(models.Model):
     percentage = models.FloatField(default=0.0)
 
     status = models.CharField(
-        max_length=20, choices=STATUS_CHOICES, default="running"
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default="starting"
     )
 
     def calculate_percentage(self):
@@ -63,6 +67,3 @@ class PracticalSession(models.Model):
             )
         else:
             self.percentage = 0
-
-    def __str__(self):
-        return f"{self.user} | {self.task}"

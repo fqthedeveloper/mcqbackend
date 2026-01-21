@@ -116,7 +116,7 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'Asia/Kolkata'
+TIME_ZONE = "Asia/Kolkata"
 
 USE_I18N = True
 
@@ -172,8 +172,6 @@ REST_FRAMEWORK = {
     }
 }
 
-# Custom user model
-AUTH_USER_MODEL = 'mcqapp.User'
 
 # Login URL for admin
 LOGIN_URL = '/admin/login/'
@@ -191,41 +189,39 @@ EMAIL_HOST_USER = 'fqthedeveloper@gmail.com'
 EMAIL_HOST_PASSWORD = 'aolo xesl pfrk venb'
 DEFAULT_FROM_EMAIL = 'fqthedeveloper@gmail.com'
 
-# Celery Configuration
+# ================= CELERY =================
 CELERY_BROKER_URL = 'redis://localhost:6379/0'
 CELERY_RESULT_BACKEND = 'django-db'
 CELERY_ACCEPT_CONTENT = ['application/json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = TIME_ZONE
+
 CELERY_BEAT_SCHEDULE = {
     'cleanup-expired-vms': {
         'task': 'practicalapp.tasks.cleanup_expired_vms',
-        'schedule': timedelta(minutes=5),
+        'schedule': 300,
     },
 }
 
-# Channels Configuration (for WebSocket)
+# ================= CHANNELS =================
+ASGI_APPLICATION = 'mcqbackend.asgi.application'
+
 CHANNEL_LAYERS = {
     'default': {
         'BACKEND': 'channels_redis.core.RedisChannelLayer',
         'CONFIG': {
-            "hosts": [('127.0.0.1', 6379)],
+            'hosts': [('127.0.0.1', 6379)],
         },
     },
 }
 
-# VirtualBox Configuration
-VIRTUALBOX_BASE_DIR = '/var/lib/virtualbox/vms'
-VIRTUALBOX_ISO_DIR = '/var/lib/virtualbox/isos'
-VIRTUALBOX_MANAGER_PATH = 'VBoxManage'  # Ensure VirtualBox is in PATH
-
-# Practical Exam Settings
+# ================= PRACTICAL SETTINGS =================
 MAX_CONCURRENT_VMS = 10
 EXAM_GRACE_PERIOD_MINUTES = 30
 AUTO_TERMINATE_AFTER_HOURS = 24
 
-# Logging Configuration
+# ================= LOGGING =================
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
@@ -233,22 +229,16 @@ LOGGING = {
         'file': {
             'level': 'INFO',
             'class': 'logging.FileHandler',
-            'filename': os.path.join(BASE_DIR, 'logs/practical_exam.log'),
+            'filename': BASE_DIR / 'logs/practical_exam.log',
         },
-        'console': {
-            'level': 'INFO',
-            'class': 'logging.StreamHandler',
-        },
+        'console': {'class': 'logging.StreamHandler'},
     },
     'loggers': {
         'practicalapp': {
             'handlers': ['file', 'console'],
             'level': 'INFO',
-            'propagate': True,
         },
     },
 }
 
-# Create necessary directories
-os.makedirs(os.path.join(BASE_DIR, 'logs'), exist_ok=True)
-os.makedirs(os.path.join(BASE_DIR, 'media/screenshots'), exist_ok=True)
+os.makedirs(BASE_DIR / 'logs', exist_ok=True)
