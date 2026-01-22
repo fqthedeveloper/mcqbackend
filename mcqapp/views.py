@@ -6,7 +6,6 @@ from django.core.mail import send_mail
 from django.contrib.auth import authenticate, get_user_model
 from django.db import IntegrityError, transaction
 from rest_framework.filters import SearchFilter
-
 import openpyxl
 from rest_framework import viewsets, status
 from rest_framework.views import APIView
@@ -17,15 +16,22 @@ from rest_framework.authentication import TokenAuthentication
 from rest_framework.authtoken.models import Token
 from rest_framework.exceptions import PermissionDenied
 from .utils import generate_otp
-
-import random
-
+from rest_framework.permissions import IsAdminUser
 from .models import (
     User, Subject, StudentSubjectEnrollment,
     Question, Exam, ExamSession, Answer, Result, EmailOTP
 )
 from .serializers import *
 from .permissions import IsAdminUserOnly, IsStudentUserOnly
+from mcqapp.models import Subject, PracticeQuestion, PracticeRun
+from mcqapp.practice_service import (
+    start_practice,
+    submit_practice_answer,
+    finish_practice,
+)
+
+
+
 
 UserModel = get_user_model()
 
@@ -273,6 +279,8 @@ class SubjectViewSet(viewsets.ModelViewSet):
     serializer_class = SubjectSerializer
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
+    
+    queryset = Subject.objects.all().order_by("name")
 
     def get_queryset(self):
         if self.request.user.user_type == 'student':
@@ -660,3 +668,131 @@ class MyProfileView(APIView):
             "last_name": user.last_name,
             "is_verified": getattr(user, "is_verified", False),
         }, status=status.HTTP_200_OK)
+        
+        
+class PracticeQuestionMapView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def post(self, request):
+        subject_id = request.data.get("subject_id")
+        difficulty = request.data.get("difficulty")
+        question_ids = request.data.get("question_ids", [])
+
+        if not subject_id or not difficulty or not question_ids:
+            return Response(
+                {"detail": "subject_id, difficulty, question_ids required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ❗ already mapped questions (ANY difficulty)
+        already_mapped = set(
+            PracticeQuestion.objects.filter(
+                subject_id=subject_id
+            ).values_list("question_id", flat=True)
+        )
+
+        created = 0
+        skipped = 0
+
+        for qid in question_ids:
+            if qid in already_mapped:
+                skipped += 1
+                continue
+
+            PracticeQuestion.objects.create(
+                subject_id=subject_id,
+                question_id=qid,
+                difficulty=difficulty
+            )
+            created += 1
+
+        return Response({
+            "status": "success",
+            "mapped": created,
+            "skipped": skipped
+        })
+
+
+# ===============================
+# PRACTICE STATS
+# ===============================
+class PracticeStatsView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        subject_id = request.query_params.get("subject_id")
+
+        if not subject_id:
+            return Response({"easy": 0, "medium": 0, "hard": 0})
+
+        qs = PracticeQuestion.objects.filter(subject_id=subject_id)
+
+        return Response({
+            "easy": qs.filter(difficulty="easy").count(),
+            "medium": qs.filter(difficulty="medium").count(),
+            "hard": qs.filter(difficulty="hard").count(),
+        })
+        
+        
+
+class StartPractice(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        subject_id = request.data.get("subject_id")
+        difficulty = request.data.get("difficulty")
+
+        if not subject_id or not difficulty:
+            return Response(
+                {"detail": "subject_id and difficulty are required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        subject = get_object_or_404(Subject, id=int(subject_id))
+
+        run, result = start_practice(request.user, subject, difficulty)
+
+        if run is None:
+            return Response(
+                {"detail": result},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        return Response({
+            "run_id": run.id,
+            "duration": run.duration_minutes,
+            "questions": PracticeQuestionSerializer(result, many=True).data
+        })
+
+
+class SubmitPracticeAnswer(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        run_id = request.data.get("run_id")
+        pq_id = request.data.get("practice_question_id")
+
+        if not run_id or not pq_id:
+            return Response({"detail": "Invalid data"}, status=400)
+
+        run = get_object_or_404(PracticeRun, id=run_id)
+        pq = get_object_or_404(PracticeQuestion, id=pq_id)
+
+        submit_practice_answer(run, pq, request.data.get("selected_answers"))
+        return Response({"status": "saved"})
+
+
+class FinishPractice(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        run_id = request.data.get("run_id")
+
+        if not run_id:
+            return Response({"detail": "run_id required"}, status=400)
+
+        run = get_object_or_404(PracticeRun, id=run_id)
+        return Response(finish_practice(run))
+    
+    
+    

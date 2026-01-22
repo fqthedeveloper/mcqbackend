@@ -56,6 +56,9 @@ class Subject(models.Model):
     name = models.CharField(max_length=100, unique=True)
     description = models.TextField(blank=True)
     is_active = models.BooleanField(default=True)
+    
+    class Meta:
+        ordering = ["name"]
 
     def __str__(self):
         return self.name
@@ -161,3 +164,42 @@ class Result(models.Model):
     score = models.PositiveIntegerField()
     total_marks = models.PositiveIntegerField()
     created_at = models.DateTimeField(auto_now_add=True)
+
+
+
+# ===== PRACTICE MODELS =====
+
+class PracticeQuestion(models.Model):
+    DIFFICULTY_CHOICES = (
+        ("easy", "Easy"),
+        ("medium", "Medium"),
+        ("hard", "Hard"),
+    )
+
+    subject = models.ForeignKey(Subject, on_delete=models.CASCADE)
+    question = models.ForeignKey(Question, on_delete=models.CASCADE)
+    difficulty = models.CharField(max_length=10, choices=DIFFICULTY_CHOICES)
+
+    class Meta:
+        # ❗ A QUESTION CAN EXIST ONLY ONCE PER SUBJECT (ANY DIFFICULTY)
+        unique_together = ("subject", "question")
+
+    def __str__(self):
+        return f"{self.subject.name} | {self.question.id} | {self.difficulty}"
+    
+
+class PracticeRun(models.Model):
+    student = models.ForeignKey(User, on_delete=models.CASCADE)
+    subject = models.ForeignKey(Subject, on_delete=models.CASCADE)
+    difficulty = models.CharField(max_length=10)
+    started_at = models.DateTimeField(auto_now_add=True)
+    duration_minutes = models.PositiveIntegerField()
+
+
+class PracticeAnswer(models.Model):
+    run = models.ForeignKey(PracticeRun, on_delete=models.CASCADE)
+    practice_question = models.ForeignKey(PracticeQuestion, on_delete=models.CASCADE)
+    selected_answers = models.CharField(max_length=50)
+    is_correct = models.BooleanField()
+    
+    

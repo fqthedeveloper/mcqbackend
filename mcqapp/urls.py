@@ -3,9 +3,9 @@ from rest_framework import routers
 from .views import (
     ResetPasswordView, UserViewSet, SubjectViewSet, QuestionViewSet,
     ExamViewSet, ExamSessionViewSet, AnswerViewSet,
-    ResultViewSet, StudentViewSet, ForgotPasswordView,
-    SendOTPView, LoginView, ForcePasswordChangeView, VerifyOTPView,
-    StudentDashboardView, AdminDashboardView, MyProfileView
+    ResultViewSet, StudentViewSet, ForgotPasswordView, PracticeStatsView,
+    SendOTPView, LoginView, ForcePasswordChangeView, VerifyOTPView, PracticeQuestionMapView,
+    StudentDashboardView, AdminDashboardView, MyProfileView, StartPractice, SubmitPracticeAnswer, FinishPractice
 )
 
 router = routers.DefaultRouter()
@@ -37,4 +37,11 @@ urlpatterns = [
     # Exam actions
     path('exams/<int:pk>/publish/', ExamViewSet.as_view({'post': 'publish'})),
     path('exams/<int:pk>/unpublish/', ExamViewSet.as_view({'post': 'unpublish'})),
+    
+    path("practice/admin/map/", PracticeQuestionMapView.as_view(),),
+    path("practice/admin/stats/", PracticeStatsView.as_view(),),
+        
+    path("practice/start/", StartPractice.as_view()),
+    path("practice/answer/", SubmitPracticeAnswer.as_view()),
+    path("practice/finish/", FinishPractice.as_view()),
 ]

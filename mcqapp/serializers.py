@@ -12,6 +12,8 @@ from .models import (
     Question, Exam, ExamSession, Answer, Result
 )
 from .models import *
+import random
+
 
 User = get_user_model()
 
@@ -477,3 +479,22 @@ class ResultSerializer(serializers.ModelSerializer):
             }
 
         return data
+    
+    
+class PracticeQuestionSerializer(serializers.ModelSerializer):
+    text = serializers.CharField(source="question.text")
+    options = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PracticeQuestion
+        fields = ("id", "text", "options")
+
+    def get_options(self, obj):
+        options = [
+            ("A", obj.question.option_a),
+            ("B", obj.question.option_b),
+            ("C", obj.question.option_c),
+            ("D", obj.question.option_d),
+        ]
+        random.shuffle(options)
+        return options
