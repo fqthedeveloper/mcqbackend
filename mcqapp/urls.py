@@ -5,7 +5,9 @@ from .views import (
     ExamViewSet, ExamSessionViewSet, AnswerViewSet,
     ResultViewSet, StudentViewSet, ForgotPasswordView, PracticeStatsView,
     SendOTPView, LoginView, ForcePasswordChangeView, VerifyOTPView, PracticeQuestionMapView,
-    StudentDashboardView, AdminDashboardView, MyProfileView, StartPractice, SubmitPracticeAnswer, FinishPractice
+    StudentDashboardView, AdminDashboardView, MyProfileView, StartPractice, SubmitPracticeAnswer, FinishPractice,
+    SendEmailOTPView, VerifyEmailOTPView, EnableTOTPView, ConfirmTOTPView, VerifyLoginTOTPView, AdminResetTOTPView,
+    
 )
 
 router = routers.DefaultRouter()
@@ -23,6 +25,9 @@ urlpatterns = [
 
     # Auth
     path('login/', LoginView.as_view(), name='login'),
+    path('login/email/send-otp/', SendEmailOTPView.as_view()),
+    path('login/email/verify-otp/', VerifyEmailOTPView.as_view()),
+    
     path('change-password/', ForcePasswordChangeView.as_view(), name='change-password'),
     path("forgot-password/", ForgotPasswordView.as_view()),
     path("reset-password/", ResetPasswordView.as_view()),
@@ -44,4 +49,5 @@ urlpatterns = [
     path("practice/start/", StartPractice.as_view()),
     path("practice/answer/", SubmitPracticeAnswer.as_view()),
     path("practice/finish/", FinishPractice.as_view()),
+    
 ]

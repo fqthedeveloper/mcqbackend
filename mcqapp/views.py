@@ -15,7 +15,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.authtoken.models import Token
 from rest_framework.exceptions import PermissionDenied
-from .utils import generate_otp
+from .utils import generate_otp, send_otp_email
 from rest_framework.permissions import IsAdminUser
 from .models import (
     User, Subject, StudentSubjectEnrollment,
@@ -29,7 +29,12 @@ from mcqapp.practice_service import (
     submit_practice_answer,
     finish_practice,
 )
-
+from .totp import (
+    generate_totp_secret,
+    get_totp_uri,
+    generate_qr_code_base64,
+    verify_totp
+)
 
 
 
@@ -91,8 +96,79 @@ class LoginView(APIView):
             'role': user.user_type,
             'email': user.email,
             'force_password_change': user.force_password_change,
-            'is_verified': user.is_verified
+            'is_verified': user.is_verified,
         })
+
+        
+class SendEmailOTPView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        email = request.data.get('email')
+
+        if not email:
+            return Response({'error': 'Email is required'}, status=400)
+
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            return Response({'error': 'User not found'}, status=404)
+
+        otp = generate_otp()
+
+        EmailOTP.objects.update_or_create(
+            user=user,
+            defaults={'otp': otp, 'created_at': timezone.now()}
+        )
+
+        send_otp_email(user.email, otp)
+
+        return Response({
+            'message': 'OTP sent to email',
+            'email': user.email
+        })
+
+
+class VerifyEmailOTPView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        email = request.data.get('email')
+        otp = request.data.get('otp')
+
+        if not email or not otp:
+            return Response({'error': 'Email and OTP are required'}, status=400)
+
+        try:
+            user = User.objects.get(email=email)
+            email_otp = user.email_otp
+        except (User.DoesNotExist, EmailOTP.DoesNotExist):
+            return Response({'error': 'Invalid request'}, status=400)
+
+        if email_otp.is_expired():
+            return Response({'error': 'OTP expired'}, status=400)
+
+        if email_otp.otp != otp:
+            return Response({'error': 'Invalid OTP'}, status=400)
+
+        # ✅ OTP VERIFIED
+        user.is_verified = True
+        user.save()
+        email_otp.delete()
+
+        # ✅ NO MFA → ISSUE TOKEN
+        token, _ = Token.objects.get_or_create(user=user)
+
+        return Response({
+            'token': token.key,
+            'full_name': f"{user.first_name} {user.last_name}",
+            'role': user.user_type,
+            'email': user.email,
+            'force_password_change': user.force_password_change,
+            'is_verified': user.is_verified,
+            'login_type': 'otp'
+        })
+
 
 
 class ForcePasswordChangeView(APIView):
@@ -795,4 +871,78 @@ class FinishPractice(APIView):
         return Response(finish_practice(run))
     
     
-    
+class EnableTOTPView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+
+        if user.is_totp_enabled:
+            return Response({"error": "TOTP already enabled"}, status=400)
+
+        secret = generate_totp_secret()
+        uri = get_totp_uri(user, secret)
+        qr_code = generate_qr_code_base64(uri)
+
+        user.totp_secret = secret
+        user.save()
+
+        return Response({
+            "qr_code": qr_code,
+            "secret": secret
+        })
+
+
+class ConfirmTOTPView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        code = request.data.get("code")
+
+        if not user.totp_secret:
+            return Response({"error": "TOTP not initialized"}, status=400)
+
+        if not verify_totp(user.totp_secret, code):
+            return Response({"error": "Invalid TOTP"}, status=400)
+
+        user.is_totp_enabled = True
+        user.totp_enabled_at = timezone.now()
+        user.save()
+
+        return Response({"message": "TOTP enabled successfully"})
+
+
+class VerifyLoginTOTPView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        code = request.data.get("code")
+
+        if not user.is_totp_enabled:
+            return Response({"error": "TOTP not enabled"}, status=400)
+
+        if not verify_totp(user.totp_secret, code):
+            return Response({"error": "Invalid TOTP"}, status=400)
+
+        return Response({"message": "TOTP verified"})
+
+
+class AdminResetTOTPView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, user_id):
+        try:
+            user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return Response({"error": "User not found"}, status=404)
+
+        user.is_totp_enabled = False
+        user.totp_secret = None
+        user.totp_enabled_at = None
+        user.save()
+
+        return Response({
+            "message": f"TOTP reset successfully for {user.email}"
+        })
