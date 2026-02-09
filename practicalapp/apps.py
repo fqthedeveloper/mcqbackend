@@ -2,5 +2,5 @@ from django.apps import AppConfig
 
 
 class PracticalappConfig(AppConfig):
-    default_auto_field = 'django.db.models.BigAutoField'
-    name = 'practicalapp'
+    default_auto_field = "django.db.models.BigAutoField"
+    name = "practicalapp"

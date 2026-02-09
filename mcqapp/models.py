@@ -85,18 +85,19 @@ class StudentSubjectEnrollment(models.Model):
 
 class Question(models.Model):
     subject = models.ForeignKey('Subject', on_delete=models.CASCADE)
-    text = models.TextField(unique=True)
+    text = models.CharField(max_length=1000)
 
     option_a = models.CharField(max_length=255)
     option_b = models.CharField(max_length=255)
     option_c = models.CharField(max_length=255)
     option_d = models.CharField(max_length=255)
 
-    # allow multiple answers: "A,B"
     correct_option = models.CharField(max_length=20)
     marks = models.PositiveIntegerField(default=1)
-
     explanation = models.TextField(blank=True)
+
+    class Meta:
+        unique_together = ('subject', 'text')
 
     def __str__(self):
         return self.text[:60]

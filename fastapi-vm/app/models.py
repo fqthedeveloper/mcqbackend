@@ -4,6 +4,8 @@ from pydantic import BaseModel
 class StartVMRequest(BaseModel):
     snapshot: str
     username: str
+    init_script: str
+
 
 
 class VerifyVMRequest(BaseModel):
