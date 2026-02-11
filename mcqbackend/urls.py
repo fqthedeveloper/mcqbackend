@@ -20,10 +20,12 @@ from django.conf import settings
 from django.conf.urls.static import static
 
 urlpatterns = [
-    path('admin/', admin.site.urls),
-    path('api/mcq/', include('mcqapp.urls')),
-    path('api/practical/', include('practicalapp.urls')),
-    path('api-auth/', include('rest_framework.urls')),
+    path("admin/", admin.site.urls),
+
+    path("api/mcq/", include("mcqapp.urls")),
+    path("api/practical/", include("practicalapp.urls")),
+
+    path("api-auth/", include("rest_framework.urls")),
 ]
 
 if settings.DEBUG:

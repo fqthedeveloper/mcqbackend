@@ -78,8 +78,8 @@ TEMPLATES = [
     },
 ]
 
-#WSGI_APPLICATION = 'mcqbackend.wsgi.application'
-ASGI_APPLICATION = 'mcqbackend.asgi.application'
+# WSGI_APPLICATION = 'mcqbackend.wsgi.application'
+# ASGI_APPLICATION = 'mcqbackend.asgi.application'
 
 import os 
 
@@ -207,56 +207,11 @@ EMAIL_HOST_USER = 'email@gmail.com'
 EMAIL_HOST_PASSWORD = 'My Password'
 DEFAULT_FROM_EMAIL = 'emial@gmail.com'
 
-# ================= CELERY =================
-CELERY_BROKER_URL = 'redis://localhost:6379/0'
-CELERY_RESULT_BACKEND = 'django-db'
-CELERY_ACCEPT_CONTENT = ['application/json']
-CELERY_TASK_SERIALIZER = 'json'
-CELERY_RESULT_SERIALIZER = 'json'
-CELERY_TIMEZONE = TIME_ZONE
-
-CELERY_BEAT_SCHEDULE = {
-    'cleanup-expired-vms': {
-        'task': 'practicalapp.tasks.cleanup_expired_vms',
-        'schedule': 300,
-    },
-}
-
 # ================= CHANNELS =================
 ASGI_APPLICATION = 'mcqbackend.asgi.application'
 
 CHANNEL_LAYERS = {
-    'default': {
-        'BACKEND': 'channels_redis.core.RedisChannelLayer',
-        'CONFIG': {
-            'hosts': [('127.0.0.1', 6379)],
-        },
-    },
+    "default": {
+        "BACKEND": "channels.layers.InMemoryChannelLayer",
+    }
 }
-
-# ================= PRACTICAL SETTINGS =================
-MAX_CONCURRENT_VMS = 10
-EXAM_GRACE_PERIOD_MINUTES = 30
-AUTO_TERMINATE_AFTER_HOURS = 24
-
-# ================= LOGGING =================
-LOGGING = {
-    'version': 1,
-    'disable_existing_loggers': False,
-    'handlers': {
-        'file': {
-            'level': 'INFO',
-            'class': 'logging.FileHandler',
-            'filename': BASE_DIR / 'logs/practical_exam.log',
-        },
-        'console': {'class': 'logging.StreamHandler'},
-    },
-    'loggers': {
-        'practicalapp': {
-            'handlers': ['file', 'console'],
-            'level': 'INFO',
-        },
-    },
-}
-
-os.makedirs(BASE_DIR / 'logs', exist_ok=True)

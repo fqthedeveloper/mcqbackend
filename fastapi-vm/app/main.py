@@ -26,6 +26,15 @@ def api_start_vm(data: StartVMRequest):
 def api_verify_vm(data: VerifyVMRequest):
     return {"output": verify_vm(data.vm_ip, data.script)}
 
+
 @app.post("/vm/destroy")
 def api_destroy_vm(data: DestroyVMRequest):
-    return destroy_vm(data.vm_name)
+    from .vagrant_vm import copy_vm_history
+
+    history_path = copy_vm_history(data.vm_name)
+    destroy_vm(data.vm_name)
+
+    return {
+        "status": "destroyed",
+        "history_path": history_path
+    }

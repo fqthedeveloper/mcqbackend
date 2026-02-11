@@ -4,6 +4,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 VAGRANT_BASE_BOX = "rockylinux/8"
 VAGRANT_VM_ROOT = os.path.join(BASE_DIR, "vms")
+HISTRY_ROOT = os.path.join(BASE_DIR, "vms_history")
 
 VM_USER = "kiosk"
 VM_PASSWORD = "redhat"

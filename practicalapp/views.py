@@ -1,49 +1,59 @@
-# practicalapp/views.py
-
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated, IsAdminUser
 from rest_framework.response import Response
+from rest_framework import status
 from django.utils import timezone
-from django.db import transaction, IntegrityError
+from django.db import transaction
+from django.http import Http404
 
 from .models import PracticalTask, PracticalSession
 from .serializers import PracticalTaskSerializer
 from .services import start_vm, verify_vm, destroy_vm
 from mcqapp.models import StudentSubjectEnrollment
 
+import os
 
-# ============================
-# ADMIN
-# ============================
+
+# ============================================================
+# ADMIN - CREATE & LIST PRACTICAL TASKS
+# ============================================================
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated, IsAdminUser])
 def admin_practical_list_create(request):
+
     if request.method == "GET":
-        tasks = PracticalTask.objects.all()
-        return Response(PracticalTaskSerializer(tasks, many=True).data)
+        tasks = PracticalTask.objects.all().order_by("-id")
+        serializer = PracticalTaskSerializer(tasks, many=True)
+        return Response(serializer.data)
 
     serializer = PracticalTaskSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     serializer.save()
-    return Response(serializer.data, status=201)
+    return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
 @api_view(["PUT"])
 @permission_classes([IsAuthenticated, IsAdminUser])
 def admin_practical_update(request, pk):
-    task = PracticalTask.objects.get(pk=pk)
+
+    try:
+        task = PracticalTask.objects.get(pk=pk)
+    except PracticalTask.DoesNotExist:
+        raise Http404("Task not found")
+
     serializer = PracticalTaskSerializer(task, data=request.data)
     serializer.is_valid(raise_exception=True)
     serializer.save()
     return Response(serializer.data)
 
 
-# ============================
+# ============================================================
 # STUDENT PRACTICAL LIST
-# ============================
+# ============================================================
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def student_practical_list(request):
+
     user = request.user
 
     subject_ids = StudentSubjectEnrollment.objects.filter(
@@ -58,6 +68,7 @@ def student_practical_list(request):
     )
 
     data = []
+
     for task in tasks:
         session = PracticalSession.objects.filter(
             user=user,
@@ -75,17 +86,21 @@ def student_practical_list(request):
     return Response(data)
 
 
-# ============================
+# ============================================================
 # TASK DETAIL (RULES PAGE)
-# ============================
+# ============================================================
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def student_practical_detail(request, pk):
-    task = PracticalTask.objects.get(
-        pk=pk,
-        is_active=True,
-        is_published=True
-    )
+
+    try:
+        task = PracticalTask.objects.get(
+            pk=pk,
+            is_active=True,
+            is_published=True
+        )
+    except PracticalTask.DoesNotExist:
+        raise Http404("Task not found")
 
     return Response({
         "id": task.id,
@@ -96,15 +111,16 @@ def student_practical_detail(request, pk):
     })
 
 
-# ============================
+# ============================================================
 # START PRACTICAL
-# ============================
+# ============================================================
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def student_practical_start(request, pk):
+
     user = request.user
 
-    # 🔒 RETURN EXISTING SESSION IF RUNNING
+    # Return existing running session
     existing = PracticalSession.objects.filter(
         user=user,
         status__in=["starting", "running"]
@@ -119,13 +135,16 @@ def student_practical_start(request, pk):
             "description": existing.task.description
         })
 
-    with transaction.atomic():
+    try:
         task = PracticalTask.objects.get(
             pk=pk,
             is_active=True,
             is_published=True
         )
+    except PracticalTask.DoesNotExist:
+        raise Http404("Task not found")
 
+    with transaction.atomic():
         session = PracticalSession.objects.create(
             user=user,
             task=task,
@@ -138,7 +157,10 @@ def student_practical_start(request, pk):
         session.status = "failed"
         session.end_time = timezone.now()
         session.save()
-        return Response({"error": "VM provisioning failed"}, status=500)
+        return Response(
+            {"error": "VM provisioning failed"},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
     session.vm_name = vm["vm_name"]
     session.vm_ip = vm["vm_ip"]
@@ -154,17 +176,20 @@ def student_practical_start(request, pk):
     })
 
 
-
-# ============================
-# GET SESSION (FIXES undefined)
-# ============================
+# ============================================================
+# GET SESSION
+# ============================================================
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_practical_session(request, pk):
-    session = PracticalSession.objects.get(
-        pk=pk,
-        user=request.user
-    )
+
+    try:
+        session = PracticalSession.objects.get(
+            pk=pk,
+            user=request.user
+        )
+    except PracticalSession.DoesNotExist:
+        raise Http404("Session not found")
 
     task = session.task
 
@@ -179,38 +204,274 @@ def get_practical_session(request, pk):
     })
 
 
-# ============================
+# ============================================================
 # SUBMIT PRACTICAL
-# ============================
+# ============================================================
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def practical_session_submit(request, pk):
-    session = PracticalSession.objects.get(
-        pk=pk,
-        user=request.user,
-        status="running"
-    )
 
+    try:
+        session = PracticalSession.objects.get(
+            pk=pk,
+            user=request.user,
+            status="running"
+        )
+    except PracticalSession.DoesNotExist:
+        raise Http404("Active session not found")
+
+    # VERIFY
     result = verify_vm(
         session.vm_ip,
         session.task.verify_script
     )
 
     score = 0
-    for line in result["output"].splitlines():
-        if line.startswith("SCORE="):
-            score = int(line.split("=")[1])
 
+    if isinstance(result, dict) and "output" in result:
+        output_text = result["output"]
+    else:
+        output_text = str(result)
+
+    for line in output_text.splitlines():
+        if line.startswith("SCORE="):
+            try:
+                score = int(line.split("=")[1])
+            except ValueError:
+                score = 0
+
+    # SAVE RESULT
     session.obtained_marks = score
     session.calculate_percentage()
     session.status = "submitted"
     session.end_time = timezone.now()
     session.save()
 
-    destroy_vm(session.vm_name)
+    # DESTROY VM
+    history_path = destroy_vm(session.vm_name)
+
+    if history_path:
+        session.history_path = history_path
+        session.save(update_fields=["history_path"])
 
     return Response({
         "marks": session.obtained_marks,
         "total_marks": session.task.total_marks,
-        "percentage": session.percentage
+        "percentage": session.percentage,
+        "vm_name": session.vm_name,
+        "history_path": session.history_path
+    })
+
+
+# ============================================================
+# STUDENT PRACTICAL RESULTS
+# ============================================================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def student_practical_results(request):
+
+    sessions = PracticalSession.objects.filter(
+        user=request.user,
+        status="submitted"
+    ).order_by("-id")
+
+    data = []
+
+    for s in sessions:
+        data.append({
+            "id": s.id,
+            "student": s.user.email,
+            "task_title": s.task.title,
+            "marks": s.obtained_marks,
+            "total_marks": s.task.total_marks,
+            "percentage": s.percentage,
+            "vm_name": s.vm_name,
+            "submitted_at": s.end_time
+        })
+
+    return Response(data)
+
+
+# ============================================================
+# ADMIN PRACTICAL RESULTS
+# ============================================================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated, IsAdminUser])
+def admin_practical_results(request):
+
+    sessions = PracticalSession.objects.filter(
+        status="submitted"
+    ).order_by("-id")
+
+    data = []
+
+    for s in sessions:
+        data.append({
+            "id": s.id,
+            "student": s.user.email,
+            "task_title": s.task.title,
+            "marks": s.obtained_marks,
+            "total_marks": s.task.total_marks,
+            "percentage": s.percentage,
+            "vm_name": s.vm_name,
+            "submitted_at": s.end_time
+        })
+
+    return Response(data)
+
+
+# ============================================================
+# RESULT DETAIL (ROLE BASED)
+# ============================================================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def practical_result_detail(request, pk):
+
+    try:
+        if request.user.is_staff:
+            session = PracticalSession.objects.get(
+                pk=pk,
+                status="submitted"
+            )
+        else:
+            session = PracticalSession.objects.get(
+                pk=pk,
+                user=request.user,
+                status="submitted"
+            )
+    except PracticalSession.DoesNotExist:
+        raise Http404("Result not found")
+
+    history_files = []
+
+    if session.history_path and os.path.exists(session.history_path):
+
+        for root, dirs, files in os.walk(session.history_path):
+            for file in files:
+                full_path = os.path.join(root, file)
+
+                relative_path = os.path.relpath(
+                    full_path,
+                    session.history_path
+                )
+
+                history_files.append({
+                    "name": relative_path
+                })
+
+    return Response({
+        "id": session.id,
+        "student": session.user.email,
+        "task_title": session.task.title,
+        "marks": session.obtained_marks,
+        "total_marks": session.task.total_marks,
+        "percentage": session.percentage,
+        "vm_name": session.vm_name,
+        "submitted_at": session.end_time,
+        "history_files": history_files
+    })
+
+
+# ============================================================
+# READ HISTORY FILE (SECURE)
+# ============================================================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def practical_history_file(request, pk):
+
+    relative_file = request.GET.get("file")
+
+    if not relative_file:
+        return Response(
+            {"error": "File parameter required"},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    try:
+        if request.user.is_staff:
+            session = PracticalSession.objects.get(pk=pk)
+        else:
+            session = PracticalSession.objects.get(
+                pk=pk,
+                user=request.user
+            )
+    except PracticalSession.DoesNotExist:
+        raise Http404("Session not found")
+
+    if not session.history_path:
+        return Response(
+            {"error": "History not available"},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    base_path = os.path.abspath(session.history_path)
+    requested_path = os.path.abspath(
+        os.path.join(base_path, relative_file)
+    )
+
+    # SECURITY: Prevent path traversal
+    if not requested_path.startswith(base_path):
+        return Response(
+            {"error": "Invalid file path"},
+            status=status.HTTP_403_FORBIDDEN
+        )
+
+    if not os.path.exists(requested_path):
+        return Response(
+            {"error": "File not found"},
+            status=status.HTTP_404_NOT_FOUND
+        )
+
+    try:
+        with open(requested_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+    except Exception:
+        return Response(
+            {"error": "Unable to read file"},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+    return Response({
+        "file": relative_file,
+        "content": content
+    })
+
+# ============================================================
+# HISTORY LIST
+# ============================================================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def practical_session_history(request, pk):
+
+    try:
+        if request.user.is_staff:
+            session = PracticalSession.objects.get(pk=pk)
+        else:
+            session = PracticalSession.objects.get(
+                pk=pk,
+                user=request.user
+            )
+    except PracticalSession.DoesNotExist:
+        return Response({"error": "Session not found"}, status=404)
+
+    if not session.history_path:
+        return Response({"error": "History not available"}, status=404)
+
+    if not os.path.exists(session.history_path):
+        return Response({"error": "History folder missing"}, status=404)
+
+    files = []
+
+    for root, dirs, filenames in os.walk(session.history_path):
+        for f in filenames:
+            full_path = os.path.join(root, f)
+            relative_path = os.path.relpath(
+                full_path,
+                session.history_path
+            )
+            files.append({"name": relative_path})
+
+    return Response({
+        "id": session.id,
+        "history_files": files
     })

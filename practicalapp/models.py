@@ -7,7 +7,6 @@ from django.db.models import Q
 
 User = settings.AUTH_USER_MODEL
 
-
 class PracticalTask(models.Model):
     title = models.CharField(max_length=200)
     description = models.TextField()
@@ -36,8 +35,19 @@ class PracticalTask(models.Model):
 
     created_at = models.DateTimeField(auto_now_add=True)
 
+    def save(self, *args, **kwargs):
+        # 🔥 CRITICAL: normalize scripts for Linux
+        if self.init_script:
+            self.init_script = self.init_script.replace("\r\n", "\n").strip() + "\n"
+
+        if self.verify_script:
+            self.verify_script = self.verify_script.replace("\r\n", "\n").strip() + "\n"
+
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return self.title
+
 
 
 class PracticalSession(models.Model):
@@ -111,6 +121,13 @@ class PracticalSession(models.Model):
         choices=STATUS_CHOICES,
         default="starting",
         db_index=True
+    )
+    
+    history_path = models.CharField(
+        max_length=500,
+        blank=True,
+        null=True
+    
     )
 
     # =========================
