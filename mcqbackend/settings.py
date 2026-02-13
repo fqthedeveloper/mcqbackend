@@ -48,6 +48,7 @@ INSTALLED_APPS = [
     'channels',
     'django_celery_beat',
     'django_celery_results',
+    'ckeditor',
 ]
 
 MIDDLEWARE = [
@@ -215,3 +216,6 @@ CHANNEL_LAYERS = {
         "BACKEND": "channels.layers.InMemoryChannelLayer",
     }
 }
+
+VM_USER = os.getenv("VM_USER", "kiosk")
+VM_PASSWORD = os.getenv("VM_PASSWORD", "redhat")

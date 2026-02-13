@@ -5,13 +5,15 @@ from rest_framework import status
 from django.utils import timezone
 from django.db import transaction
 from django.http import Http404
-
 from .models import PracticalTask, PracticalSession
 from .serializers import PracticalTaskSerializer
 from .services import start_vm, verify_vm, destroy_vm
 from mcqapp.models import StudentSubjectEnrollment
-
 import os
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -203,7 +205,6 @@ def get_practical_session(request, pk):
         "vm_ip": session.vm_ip,
     })
 
-
 # ============================================================
 # SUBMIT PRACTICAL
 # ============================================================
@@ -220,46 +221,46 @@ def practical_session_submit(request, pk):
     except PracticalSession.DoesNotExist:
         raise Http404("Active session not found")
 
-    # VERIFY
-    result = verify_vm(
-        session.vm_ip,
-        session.task.verify_script
-    )
-
     score = 0
+    output_text = ""
+    history_path = None
 
-    if isinstance(result, dict) and "output" in result:
-        output_text = result["output"]
-    else:
-        output_text = str(result)
+    try:
+        result = verify_vm(
+            session.vm_ip,
+            session.task.verify_script
+        )
 
-    for line in output_text.splitlines():
-        if line.startswith("SCORE="):
-            try:
-                score = int(line.split("=")[1])
-            except ValueError:
-                score = 0
+        score = int(result.get("score", 0))
+        output_text = result.get("raw_output", "")
 
-    # SAVE RESULT
+    except Exception as e:
+        output_text = f"Verification failed: {str(e)}"
+        score = 0
+
+    finally:
+        try:
+            history_path = destroy_vm(session.vm_name)
+        except Exception:
+            history_path = None
+
     session.obtained_marks = score
     session.calculate_percentage()
     session.status = "submitted"
     session.end_time = timezone.now()
-    session.save()
-
-    # DESTROY VM
-    history_path = destroy_vm(session.vm_name)
 
     if history_path:
         session.history_path = history_path
-        session.save(update_fields=["history_path"])
+
+    session.save()
 
     return Response({
         "marks": session.obtained_marks,
         "total_marks": session.task.total_marks,
         "percentage": session.percentage,
         "vm_name": session.vm_name,
-        "history_path": session.history_path
+        "history_path": session.history_path,
+        "raw_output": output_text
     })
 
 

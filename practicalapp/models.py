@@ -3,21 +3,21 @@ from django.conf import settings
 from django.utils import timezone
 from mcqapp.models import Subject
 from django.db.models import Q
+from ckeditor.fields import RichTextField
+
 
 
 User = settings.AUTH_USER_MODEL
 
 class PracticalTask(models.Model):
     title = models.CharField(max_length=200)
-    description = models.TextField()
+    ddescription = RichTextField() 
 
     subject = models.ForeignKey(
         Subject,
         on_delete=models.CASCADE,
         related_name="practical_exams"
     )
-
-    snapshot_name = models.CharField(max_length=100)
 
     init_script = models.TextField(
         help_text="Executed at VM boot to prepare/break environment"

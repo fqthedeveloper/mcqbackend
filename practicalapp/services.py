@@ -11,22 +11,15 @@ FASTAPI_VM_URL = "http://127.0.0.1:9000"
 
 # Hard limits (seconds)
 VM_START_TIMEOUT = 600      # 10 minutes (VM boot can be slow)
-VM_VERIFY_TIMEOUT = 60
-VM_DESTROY_TIMEOUT = 60
+VM_VERIFY_TIMEOUT = 300
+VM_DESTROY_TIMEOUT = 300
 
 
 # ============================
 # START VM
 # ============================
 def start_vm(task, user_email: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Calls FastAPI VM service to start a VM.
-
-    IMPORTANT:
-    - This function MAY BLOCK for several minutes.
-    - It MUST be called from a background thread.
-    """
-
+    
     payload = {
         "init_script": task.init_script
     }
@@ -98,12 +91,11 @@ def start_vm(task, user_email: Optional[str] = None) -> Dict[str, Any]:
             "detail": str(e)
         }
 
-def verify_vm(vm_ip: str, verify_script: str) -> Dict[str, Any]:
-    """
-    Calls FastAPI VM service to execute verification script.
-    """
 
-    logger.info("Verifying VM | vm_ip=%s", vm_ip)
+# ============================
+# VERIFY VM
+# ============================
+def verify_vm(vm_ip: str, verify_script: str) -> Dict[str, Any]:
 
     response = requests.post(
         f"{FASTAPI_VM_URL}/vm/verify",
@@ -118,37 +110,26 @@ def verify_vm(vm_ip: str, verify_script: str) -> Dict[str, Any]:
 
     data = response.json()
 
-    if not isinstance(data, dict):
-        raise ValueError("Invalid verify response from VM service")
-
-    return data
+    return {
+        "score": int(data.get("score", 0)),
+        "raw_output": data.get("raw_output", "")
+    }
 
 
 # ============================
 # DESTROY VM
 # ============================
+
 def destroy_vm(vm_name: str) -> str:
-    """
-    Requests VM destruction and receives history path.
-    """
 
-    logger.info("Destroying VM | vm_name=%s", vm_name)
+    response = requests.post(
+        f"{FASTAPI_VM_URL}/vm/destroy",
+        json={"vm_name": vm_name},
+        timeout=VM_DESTROY_TIMEOUT
+    )
 
-    try:
-        response = requests.post(
-            f"{FASTAPI_VM_URL}/vm/destroy",
-            json={"vm_name": vm_name},
-            timeout=VM_DESTROY_TIMEOUT
-        )
+    response.raise_for_status()
 
-        data = response.json()
+    data = response.json()
 
-        return data.get("history_path")
-
-    except requests.exceptions.RequestException as e:
-        logger.warning(
-            "Failed VM destroy | vm_name=%s | error=%s",
-            vm_name,
-            str(e),
-        )
-        return None
+    return data.get("history_path")
