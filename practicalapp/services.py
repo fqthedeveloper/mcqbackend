@@ -2,6 +2,8 @@ import requests
 import logging
 from typing import Dict, Any, Optional
 
+from practicalapp.models import PracticalSession
+
 logger = logging.getLogger(__name__)
 
 # ============================
@@ -93,43 +95,90 @@ def start_vm(task, user_email: Optional[str] = None) -> Dict[str, Any]:
 
 
 # ============================
-# VERIFY VM
-# ============================
-def verify_vm(vm_ip: str, verify_script: str) -> Dict[str, Any]:
-
-    response = requests.post(
-        f"{FASTAPI_VM_URL}/vm/verify",
-        json={
-            "vm_ip": vm_ip,
-            "script": verify_script
-        },
-        timeout=VM_VERIFY_TIMEOUT
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    return {
-        "score": int(data.get("score", 0)),
-        "raw_output": data.get("raw_output", "")
-    }
-
-
-# ============================
-# DESTROY VM
+# VERIFY VM (SAFE VERSION)
 # ============================
 
-def destroy_vm(vm_name: str) -> str:
+def verify_vm(vm_ip: str, verify_script: str):
 
-    response = requests.post(
-        f"{FASTAPI_VM_URL}/vm/destroy",
-        json={"vm_name": vm_name},
-        timeout=VM_DESTROY_TIMEOUT
-    )
+    if not vm_ip:
+        return {
+            "score": 0,
+            "raw_output": "VM IP not available",
+            "details": []
+        }
 
-    response.raise_for_status()
+    try:
+        response = requests.post(
+            f"{FASTAPI_VM_URL}/vm/verify",
+            json={
+                "vm_ip": vm_ip,
+                "script": verify_script
+            },
+            timeout=VM_VERIFY_TIMEOUT
+        )
 
-    data = response.json()
+        response.raise_for_status()
 
-    return data.get("history_path")
+        data = response.json()
+
+        return {
+            "score": data.get("score", 0),
+            "raw_output": data.get("raw_output", ""),
+            "details": data.get("details", [])
+        }
+
+    except requests.Timeout:
+        return {
+            "score": 0,
+            "raw_output": "Verification timeout",
+            "details": []
+        }
+
+    except requests.RequestException as e:
+        return {
+            "score": 0,
+            "raw_output": f"FastAPI error: {str(e)}",
+            "details": []
+        }
+
+
+# ============================
+# DESTROY VM REMOTE (SAFE)
+# ============================
+
+def destroy_vm_remote(session: PracticalSession):
+
+    if not session.vm_name:
+        logger.error("Destroy skipped — vm_name is empty for session %s", session.id)
+        return None
+
+    logger.info("Destroying VM | session=%s vm_name=%s",
+                session.id, session.vm_name)
+
+    try:
+        response = requests.post(
+            f"{FASTAPI_VM_URL}/vm/destroy",
+            json={"vm_name": session.vm_name},
+            timeout=VM_DESTROY_TIMEOUT
+        )
+
+        response.raise_for_status()
+        data = response.json()
+
+        logger.info("Destroy response: %s", data)
+
+        history_path = data.get("history_path")
+
+        if history_path:
+            session.history_path = history_path
+            session.save(update_fields=["history_path"])
+
+        return history_path
+
+    except requests.Timeout:
+        logger.error("VM destroy timeout for session %s", session.id)
+        return None
+
+    except requests.RequestException as e:
+        logger.error("VM destroy error: %s", str(e))
+        return None

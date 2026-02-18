@@ -7,10 +7,12 @@ from django.db import transaction
 from django.http import Http404
 from .models import PracticalTask, PracticalSession
 from .serializers import PracticalTaskSerializer
-from .services import start_vm, verify_vm, destroy_vm
+from .services import start_vm, verify_vm, destroy_vm_remote
 from mcqapp.models import StudentSubjectEnrollment
 import os
 import logging
+from mcqbackend.settings import HISTORY_ROOT
+
 
 
 logger = logging.getLogger(__name__)
@@ -204,16 +206,18 @@ def get_practical_session(request, pk):
         "start_time": session.start_time,
         "vm_ip": session.vm_ip,
     })
-
-# ============================================================
-# SUBMIT PRACTICAL
-# ============================================================
+    
+    
+# ========================
+# Submit VM
+# ========================
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
+@transaction.atomic
 def practical_session_submit(request, pk):
 
     try:
-        session = PracticalSession.objects.get(
+        session = PracticalSession.objects.select_for_update().get(
             pk=pk,
             user=request.user,
             status="running"
@@ -221,46 +225,44 @@ def practical_session_submit(request, pk):
     except PracticalSession.DoesNotExist:
         raise Http404("Active session not found")
 
-    score = 0
-    output_text = ""
-    history_path = None
+    # ========================
+    # VERIFY
+    # ========================
+    verify_result = verify_vm(
+        session.vm_ip,
+        session.task.verify_script
+    )
 
-    try:
-        result = verify_vm(
-            session.vm_ip,
-            session.task.verify_script
-        )
-
-        score = int(result.get("score", 0))
-        output_text = result.get("raw_output", "")
-
-    except Exception as e:
-        output_text = f"Verification failed: {str(e)}"
-        score = 0
-
-    finally:
-        try:
-            history_path = destroy_vm(session.vm_name)
-        except Exception:
-            history_path = None
-
-    session.obtained_marks = score
-    session.calculate_percentage()
-    session.status = "submitted"
+    session.obtained_marks = verify_result.get("score", 0)
+    session.verification_output = verify_result.get("raw_output", "")
+    session.verification_details = verify_result.get("details", [])
     session.end_time = timezone.now()
+    session.status = "submitted"
 
-    if history_path:
-        session.history_path = history_path
+    session.calculate_percentage()
+    session.is_passed = session.percentage >= 50
 
     session.save()
 
+    # ========================
+    # DESTROY VM
+    # ========================
+    history_path = destroy_vm_remote(session)
+
+    if history_path:
+        session.history_path = history_path
+        session.save(update_fields=["history_path"])
+
     return Response({
+        "id": session.id,
         "marks": session.obtained_marks,
         "total_marks": session.task.total_marks,
         "percentage": session.percentage,
-        "vm_name": session.vm_name,
-        "history_path": session.history_path,
-        "raw_output": output_text
+        "passed": session.is_passed,
+        "details": session.verification_details,
+        "raw_output": session.verification_output,
+        "history_available": bool(session.history_path),
+        "submitted_at": session.end_time
     })
 
 
@@ -287,7 +289,9 @@ def student_practical_results(request):
             "total_marks": s.task.total_marks,
             "percentage": s.percentage,
             "vm_name": s.vm_name,
-            "submitted_at": s.end_time
+            "submitted_at": s.end_time,
+            "verification_details": s.verification_details,
+            "verification_output": s.verification_output,
         })
 
     return Response(data)
@@ -315,15 +319,18 @@ def admin_practical_results(request):
             "total_marks": s.task.total_marks,
             "percentage": s.percentage,
             "vm_name": s.vm_name,
-            "submitted_at": s.end_time
+            "submitted_at": s.end_time,
+            "verification_details": s.verification_details,
+            "verification_output": s.verification_output,
         })
 
     return Response(data)
 
 
 # ============================================================
-# RESULT DETAIL (ROLE BASED)
+# RESULT DETAIL (FULL FIXED VERSION)
 # ============================================================
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def practical_result_detail(request, pk):
@@ -367,6 +374,9 @@ def practical_result_detail(request, pk):
         "marks": session.obtained_marks,
         "total_marks": session.task.total_marks,
         "percentage": session.percentage,
+        "passed": session.is_passed,
+        "details": session.verification_details,
+        "raw_output": session.verification_output,
         "vm_name": session.vm_name,
         "submitted_at": session.end_time,
         "history_files": history_files

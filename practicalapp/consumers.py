@@ -67,7 +67,8 @@ class SSHConsumer(AsyncWebsocketConsumer):
                 # Clean exam terminal banner
                 time.sleep(1)
                 self.channel.send("clear\n")
-                self.channel.send("      EXAM TERMINAL CONNECTED       '\n")
+                self.channel.send("      #EXAM TERMINAL CONNECTED ")
+                self.channel.send("clear\n")
 
                 return
 

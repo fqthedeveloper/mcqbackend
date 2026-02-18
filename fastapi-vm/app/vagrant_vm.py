@@ -7,9 +7,10 @@ import uuid
 import time
 import shutil
 import paramiko
+import threading
+import sys
 
 from .config import (
-    BASE_DIR,
     VAGRANT_BASE_BOX,
     VAGRANT_VM_ROOT,
     VM_USER,
@@ -21,29 +22,79 @@ from .config import (
 )
 
 # ============================================================
-# IP ALLOCATION
+# CROSS-PLATFORM FILE LOCKING (SAFE)
 # ============================================================
-def allocate_ip():
+
+if sys.platform == "win32":
+    import msvcrt
+
+    def lock_file(f):
+        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+
+    def unlock_file(f):
+        try:
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        except:
+            pass
+else:
+    import fcntl
+
+    def lock_file(f):
+        fcntl.flock(f, fcntl.LOCK_EX)
+
+    def unlock_file(f):
+        try:
+            fcntl.flock(f, fcntl.LOCK_UN)
+        except:
+            pass
+
+# ============================================================
+# GLOBAL LIMITER
+# ============================================================
+
+MAX_PARALLEL_VM_START = 5
+vm_boot_semaphore = threading.Semaphore(MAX_PARALLEL_VM_START)
+
+IP_LOCK_FILE = os.path.join(VAGRANT_VM_ROOT, "ip_alloc.lock")
+
+# ============================================================
+# THREAD-SAFE IP ALLOCATION (FIXED — NO DUPLICATE IP)
+# ============================================================
+
+def allocate_ip(vm_dir):
     os.makedirs(VAGRANT_VM_ROOT, exist_ok=True)
-    used_ips = set()
 
-    for d in os.listdir(VAGRANT_VM_ROOT):
-        ip_file = os.path.join(VAGRANT_VM_ROOT, d, "ip.txt")
-        if os.path.exists(ip_file):
-            with open(ip_file) as f:
-                used_ips.add(f.read().strip())
+    lockfile = open(IP_LOCK_FILE, "a+")
+    lock_file(lockfile)
 
-    for i in range(VM_IP_START, 250):
-        candidate = f"{VM_IP_BASE}{i}"
-        if candidate not in used_ips:
-            return candidate
+    try:
+        used_ips = set()
 
-    raise Exception("No free IPs available")
+        for d in os.listdir(VAGRANT_VM_ROOT):
+            ip_file = os.path.join(VAGRANT_VM_ROOT, d, "ip.txt")
+            if os.path.exists(ip_file):
+                with open(ip_file) as f:
+                    used_ips.add(f.read().strip())
 
+        for i in range(VM_IP_START, 250):
+            candidate = f"{VM_IP_BASE}{i}"
+            if candidate not in used_ips:
+                # RESERVE IP IMMEDIATELY
+                os.makedirs(vm_dir, exist_ok=True)
+                with open(os.path.join(vm_dir, "ip.txt"), "w") as f:
+                    f.write(candidate)
+                return candidate
+
+        raise Exception("No free IPs available")
+
+    finally:
+        unlock_file(lockfile)
+        lockfile.close()
 
 # ============================================================
-# CREATE VAGRANTFILE
+# VAGRANTFILE CREATION
 # ============================================================
+
 def create_vagrantfile(vm_dir, vm_name, vm_ip):
 
     content = f"""
@@ -70,21 +121,28 @@ end
     with open(os.path.join(vm_dir, "Vagrantfile"), "w", encoding="utf-8") as f:
         f.write(content.strip())
 
-
 # ============================================================
 # ATTACH EXTRA DISKS
 # ============================================================
+
 def attach_extra_disks(vm_name, vm_dir):
 
-    subprocess.run(["VBoxManage", "controlvm", vm_name, "poweroff"], check=True)
-    time.sleep(2)
+    try:
+        subprocess.run(
+            ["VBoxManage", "controlvm", vm_name, "poweroff"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        time.sleep(2)
+    except:
+        pass
 
     subprocess.run([
         "VBoxManage", "storagectl", vm_name,
         "--name", "ExamSATA",
         "--add", "sata",
         "--controller", "IntelAhci"
-    ], check=True)
+    ], check=False)
 
     for index, disk in enumerate(EXTRA_DISKS):
         disk_path = os.path.join(vm_dir, disk["name"]).replace("\\", "/")
@@ -94,7 +152,7 @@ def attach_extra_disks(vm_name, vm_dir):
             "VBoxManage", "createmedium", "disk",
             "--filename", disk_path,
             "--size", str(size)
-        ], check=True)
+        ], check=False)
 
         subprocess.run([
             "VBoxManage", "storageattach", vm_name,
@@ -103,62 +161,52 @@ def attach_extra_disks(vm_name, vm_dir):
             "--device", "0",
             "--type", "hdd",
             "--medium", disk_path
-        ], check=True)
-
-    subprocess.run(["VBoxManage", "startvm", vm_name, "--type", "headless"], check=True)
-
+        ], check=False)
 
 # ============================================================
-# WAIT FOR SSH
+# WAIT FOR SSH (HARDENED)
 # ============================================================
+
 def wait_for_ssh(ip):
-
     print(f"Waiting for SSH on {ip}...")
 
     start_time = time.time()
+    last_error = None
 
     while time.time() - start_time < SSH_TIMEOUT:
+
         try:
-            # Step 1: Check if port 22 is open
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            result = sock.connect_ex((ip, 22))
+            sock = socket.create_connection((ip, 22), timeout=5)
             sock.close()
+        except:
+            time.sleep(5)
+            continue
 
-            if result != 0:
-                print("Port 22 not open yet...")
-                time.sleep(5)
-                continue
-
-            # Step 2: Try SSH login
+        try:
             ssh = paramiko.SSHClient()
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
             ssh.connect(
                 ip,
                 username="vagrant",
                 password="vagrant",
-                timeout=5,
+                timeout=20,
                 allow_agent=False,
                 look_for_keys=False
             )
-
             ssh.close()
-            print("SSH is ready.")
+            print("SSH ready")
             return
-
         except Exception as e:
-            print(f"SSH not ready yet: {e}")
+            last_error = e
             time.sleep(5)
 
-    raise Exception(f"SSH did not become ready in time for IP {ip}")
-
+    raise Exception(f"SSH timeout for {ip}: {last_error}")
 
 # ============================================================
 # PREPARE EXAM USER
 # ============================================================
-def prepare_exam_user(ip):
 
+def prepare_exam_user(ip):
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     ssh.connect(ip, username="vagrant", password="vagrant")
@@ -177,12 +225,11 @@ sudo systemctl restart sshd
     ssh.exec_command(commands)
     ssh.close()
 
+# ============================================================
+# RUN INIT SCRIPT (SAFE)
+# ============================================================
 
-# ============================================================
-# RUN INIT SCRIPT
-# ============================================================
 def run_init_script(ip, init_script):
-
     if not init_script.strip():
         return
 
@@ -190,7 +237,6 @@ def run_init_script(ip, init_script):
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     ssh.connect(ip, username="vagrant", password="vagrant")
 
-    sftp = ssh.open_sftp()
     remote_path = "/tmp/init_exam.sh"
 
     full_script = f"""#!/bin/bash
@@ -201,86 +247,79 @@ echo "=== INIT START ==="
 echo "=== INIT END ==="
 """
 
+    sftp = ssh.open_sftp()
     with sftp.file(remote_path, "w") as f:
         f.write(full_script)
-
     sftp.close()
 
-    ssh.exec_command(f"sudo chmod 755 {remote_path}")
+    ssh.exec_command(f"chmod +x {remote_path}")
 
     stdin, stdout, stderr = ssh.exec_command(
-        f"sudo /bin/bash {remote_path}",
-        get_pty=True
+        f"echo vagrant | sudo -S bash {remote_path}"
     )
-    stdin.write("vagrant\n")
-    stdin.flush()
 
     exit_code = stdout.channel.recv_exit_status()
 
     if exit_code != 0:
-        log = stdout.read().decode()
+        log = stdout.read().decode(errors="ignore")
         ssh.close()
         raise Exception(f"Init script failed:\n{log}")
 
     ssh.close()
 
+# ============================================================
+# START VM (NO CRASH, SAFE CONCURRENCY)
+# ============================================================
 
-# ============================================================
-# START VM
-# ============================================================
 def start_vm(init_script):
+    with vm_boot_semaphore:
 
-    vm_id = f"exam-{uuid.uuid4().hex[:6]}"
-    vm_dir = os.path.join(VAGRANT_VM_ROOT, vm_id)
-    vm_ip = allocate_ip()
+        vm_id = f"exam-{uuid.uuid4().hex[:6]}"
+        vm_dir = os.path.join(VAGRANT_VM_ROOT, vm_id)
 
-    os.makedirs(vm_dir, exist_ok=True)
+        vm_ip = allocate_ip(vm_dir)
 
-    create_vagrantfile(vm_dir, vm_id, vm_ip)
+        create_vagrantfile(vm_dir, vm_id, vm_ip)
 
-    # Boot VM
-    subprocess.run(["vagrant", "up"], cwd=vm_dir, check=True)
+        try:
+            subprocess.run(["vagrant", "up"], cwd=vm_dir, check=True)
+            wait_for_ssh(vm_ip)
+            prepare_exam_user(vm_ip)
 
-    # Wait for system to stabilize before disk operations
-    print("Initial boot delay...")
-    time.sleep(20)
+            subprocess.run(["vagrant", "halt"], cwd=vm_dir, check=True)
 
-    # Attach disks (this will reboot VM)
-    attach_extra_disks(vm_id, vm_dir)
+            if EXTRA_DISKS:
+                attach_extra_disks(vm_id, vm_dir)
 
-    # Wait again after reboot
-    print("Waiting after reboot...")
-    time.sleep(25)
+            subprocess.run(["vagrant", "up"], cwd=vm_dir, check=True)
+            wait_for_ssh(vm_ip)
 
-    with open(os.path.join(vm_dir, "ip.txt"), "w") as f:
-        f.write(vm_ip)
+            run_init_script(vm_ip, init_script)
 
-    # Now wait for SSH properly
-    wait_for_ssh(vm_ip)
+            return {
+                "vm_name": vm_id,
+                "vm_ip": vm_ip,
+                "username": VM_USER,
+                "password": VM_PASSWORD,
+            }
 
-    # Prepare exam user
-    prepare_exam_user(vm_ip)
+        except Exception as e:
+            # CLEANUP ON FAILURE
+            try:
+                subprocess.run(["vagrant", "destroy", "-f"], cwd=vm_dir)
+            except:
+                pass
 
-    # Run init script
-    run_init_script(vm_ip, init_script)
+            shutil.rmtree(vm_dir, ignore_errors=True)
+            raise e
 
-    return {
-        "vm_name": vm_id,
-        "vm_ip": vm_ip,
-        "username": VM_USER,
-        "password": VM_PASSWORD,
-    }
-
-
-# ============================
-# VERIFY VM (REAL EXECUTION)
-# ============================
+# ============================================================
+# VERIFY VM
+# ============================================================
 
 def verify_vm(vm_ip: str, verify_script: str) -> Dict[str, Any]:
-
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
     ssh.connect(vm_ip, username="vagrant", password="vagrant")
 
     remote_path = "/tmp/verify_exam.sh"
@@ -311,76 +350,69 @@ echo "FINAL_SCORE=$SCORE"
     ssh.close()
 
     full_output = output + "\n" + error
-
     match = re.search(r"FINAL_SCORE=(\d+)", full_output)
-
-    if match:
-        score = int(match.group(1))
-    else:
-        score = 0
+    score = int(match.group(1)) if match else 0
 
     return {
         "score": score,
         "raw_output": full_output
     }
 
-
-# ============================
+# ============================================================
 # COPY HISTORY
-# ============================
+# ============================================================
 
-def copy_vm_history(vm_name: str):
+# def copy_vm_history(vm_name: str):
+#     vm_dir = os.path.join(VAGRANT_VM_ROOT, vm_name)
+#     ip_file = os.path.join(vm_dir, "ip.txt")
 
-    vm_dir = os.path.join(VAGRANT_VM_ROOT, vm_name)
-    ip_file = os.path.join(vm_dir, "ip.txt")
+#     if not os.path.exists(ip_file):
+#         return None
 
-    if not os.path.exists(ip_file):
-        return None
+#     vm_ip = open(ip_file).read().strip()
 
-    vm_ip = open(ip_file).read().strip()
+#     history_dir = os.path.join(BASE_DIR, vm_name)
+#     os.makedirs(history_dir, exist_ok=True)
 
-    history_dir = os.path.join(BASE_DIR, vm_name)
-    os.makedirs(history_dir, exist_ok=True)
+#     ssh = paramiko.SSHClient()
+#     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+#     ssh.connect(vm_ip, username="vagrant", password="vagrant")
 
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(vm_ip, username="vagrant", password="vagrant")
+#     try:
+#         ssh.exec_command("history -a")
 
-    try:
-        ssh.exec_command("history -a")
+#         stdin, stdout, stderr = ssh.exec_command(
+#             "echo vagrant | sudo -S bash -c 'history -a && cat /root/.bash_history 2>/dev/null'"
+#         )
+#         root_history = stdout.read().decode(errors="ignore")
 
-        stdin, stdout, stderr = ssh.exec_command(
-            "echo vagrant | sudo -S bash -c 'history -a && cat /root/.bash_history 2>/dev/null'"
-        )
-        root_history = stdout.read().decode(errors="ignore")
+#         with open(os.path.join(history_dir, "root_history.txt"), "w") as f:
+#             f.write(root_history)
 
-        with open(os.path.join(history_dir, "root_history.txt"), "w") as f:
-            f.write(root_history)
+#         stdin, stdout, stderr = ssh.exec_command(
+#             "cat /home/vagrant/.bash_history 2>/dev/null"
+#         )
+#         user_history = stdout.read().decode(errors="ignore")
 
-        stdin, stdout, stderr = ssh.exec_command(
-            "cat /home/vagrant/.bash_history 2>/dev/null"
-        )
-        user_history = stdout.read().decode(errors="ignore")
+#         with open(os.path.join(history_dir, "exam_user_history.txt"), "w") as f:
+#             f.write(user_history)
 
-        with open(os.path.join(history_dir, "exam_user_history.txt"), "w") as f:
-            f.write(user_history)
+#     finally:
+#         ssh.close()
 
-    finally:
-        ssh.close()
+#     return history_dir
 
-    return history_dir
-
-
-# ============================
+# ============================================================
 # DESTROY VM
-# ============================
+# ============================================================
 
-def destroy_vm(vm_name: str):
-
+def destroy_vm_local(vm_name: str):
     vm_dir = os.path.join(VAGRANT_VM_ROOT, vm_name)
 
-    if os.path.exists(vm_dir):
-        subprocess.run(["vagrant", "destroy", "-f"], cwd=vm_dir)
-        shutil.rmtree(vm_dir, ignore_errors=True)
+    if not os.path.exists(vm_dir):
+        return False
+
+    subprocess.run(["vagrant", "destroy", "-f"], cwd=vm_dir)
+    shutil.rmtree(vm_dir, ignore_errors=True)
 
     return True
