@@ -13,7 +13,7 @@ User = settings.AUTH_USER_MODEL
 
 
 class PracticalTask(models.Model):
-    title = models.CharField(max_length=200)
+    title = models.CharField(max_length=200, unique=True)
     description = RichTextField()
 
     subject = models.ForeignKey(

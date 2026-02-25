@@ -178,7 +178,7 @@ def wait_for_ssh(ip):
         try:
             sock = socket.create_connection((ip, 22), timeout=5)
             sock.close()
-        except:
+        except Exception:
             time.sleep(5)
             continue
 
@@ -218,7 +218,12 @@ sudo usermod -aG wheel {VM_USER} || true
 sudo mkdir -p /etc/sudoers.d
 echo "{VM_USER} ALL=(ALL) ALL" | sudo tee /etc/sudoers.d/{VM_USER}
 sudo chmod 440 /etc/sudoers.d/{VM_USER}
+
+# Enable SSH password login
 sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+sudo sed -i 's/^PermitRootLogin no/PermitRootLogin yes/' /etc/ssh/sshd_config
+
+
 sudo systemctl restart sshd
 """
 

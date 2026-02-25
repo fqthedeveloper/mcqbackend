@@ -18,9 +18,9 @@ from mcqbackend.settings import HISTORY_ROOT
 logger = logging.getLogger(__name__)
 
 
-# ============================================================
-# ADMIN - CREATE & LIST PRACTICAL TASKS
-# ============================================================
+# ============================
+# LIST + CREATE
+# ============================
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated, IsAdminUser])
 def admin_practical_list_create(request):
@@ -33,10 +33,14 @@ def admin_practical_list_create(request):
     serializer = PracticalTaskSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     serializer.save()
+
     return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
-@api_view(["PUT"])
+# ============================
+# UPDATE
+# ============================
+@api_view(["PATCH"])
 @permission_classes([IsAuthenticated, IsAdminUser])
 def admin_practical_update(request, pk):
 
@@ -45,11 +49,16 @@ def admin_practical_update(request, pk):
     except PracticalTask.DoesNotExist:
         raise Http404("Task not found")
 
-    serializer = PracticalTaskSerializer(task, data=request.data)
+    serializer = PracticalTaskSerializer(
+        task,
+        data=request.data,
+        partial=True
+    )
+
     serializer.is_valid(raise_exception=True)
     serializer.save()
-    return Response(serializer.data)
 
+    return Response(serializer.data)
 
 # ============================================================
 # STUDENT PRACTICAL LIST
@@ -115,6 +124,33 @@ def student_practical_detail(request, pk):
     })
 
 
+def render_description(task, session):
+    """
+    Replace dynamic placeholders inside task description.
+    Supported:
+        {{VM_IP}}, {ip}
+        {{VM_NAME}}, {vm_name}
+        {{VM_USER}}, {vm_user}
+    """
+
+    description = task.description or ""
+
+    replacements = {
+        "{{VM_IP}}": session.vm_ip or "",
+        "{ip}": session.vm_ip or "",
+
+        "{{VM_NAME}}": session.vm_name or "",
+        "{vm_name}": session.vm_name or "",
+
+        "{{VM_USER}}": "kiosk",
+        "{vm_user}": "kiosk",
+    }
+
+    for key, value in replacements.items():
+        description = description.replace(key, value)
+
+    return description
+
 # ============================================================
 # START PRACTICAL
 # ============================================================
@@ -131,12 +167,14 @@ def student_practical_start(request, pk):
     ).order_by("-id").first()
 
     if existing:
+        description = render_description(existing.task, existing)
+
         return Response({
             "session_id": existing.id,
             "vm_ip": existing.vm_ip,
             "duration": existing.task.duration_minutes,
             "title": existing.task.title,
-            "description": existing.task.description
+            "description": description
         })
 
     try:
@@ -171,12 +209,14 @@ def student_practical_start(request, pk):
     session.status = "running"
     session.save()
 
+    description = render_description(task, session)
+
     return Response({
         "session_id": session.id,
         "vm_ip": session.vm_ip,
         "duration": task.duration_minutes,
         "title": task.title,
-        "description": task.description
+        "description": description
     })
 
 
@@ -197,14 +237,17 @@ def get_practical_session(request, pk):
 
     task = session.task
 
+    description = render_description(task, session)
+
     return Response({
         "id": session.id,
         "status": session.status,
         "title": task.title,
-        "description": task.description,
+        "description": description,
         "duration": task.duration_minutes,
         "start_time": session.start_time,
         "vm_ip": session.vm_ip,
+        "vm_name": session.vm_name,
     })
     
     
