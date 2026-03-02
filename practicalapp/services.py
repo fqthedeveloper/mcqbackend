@@ -1,103 +1,80 @@
 import requests
 import logging
+import time
 from typing import Dict, Any, Optional
 
 from practicalapp.models import PracticalSession
 
 logger = logging.getLogger(__name__)
 
-# ============================
-# CONFIG
-# ============================
 FASTAPI_VM_URL = "http://127.0.0.1:9000"
 
-# Hard limits (seconds)
-VM_START_TIMEOUT = 600      # 10 minutes (VM boot can be slow)
 VM_VERIFY_TIMEOUT = 300
 VM_DESTROY_TIMEOUT = 300
+VM_STATUS_TIMEOUT = 900          # 15 minutes max wait
+VM_STATUS_POLL_INTERVAL = 5      # seconds
 
 
-# ============================
-# START VM
-# ============================
-def start_vm(task, user_email: Optional[str] = None) -> Dict[str, Any]:
-    
-    payload = {
-        "init_script": task.init_script
-    }
-
-    # Optional metadata (safe to ignore on VM side)
-    if user_email:
-        payload["user_email"] = user_email
-
-    logger.info(
-        "Requesting VM start | task_id=%s user=%s",
-        getattr(task, "id", None),
-        user_email,
-    )
+# ==========================================
+# START VM (NON BLOCKING + POLLING)
+# ==========================================
+def start_vm(task, user_email=None):
 
     try:
+        # STEP 1: Ask FastAPI to start VM (non-blocking)
         response = requests.post(
             f"{FASTAPI_VM_URL}/vm/start",
-            json=payload,
-            timeout=VM_START_TIMEOUT
+            json={"init_script": task.init_script},
+            timeout=60
         )
 
         response.raise_for_status()
-
         data = response.json()
 
-        # Basic validation
-        if not isinstance(data, dict):
-            raise ValueError("Invalid response format from VM service")
+        vm_name = data.get("vm_name")
 
-        if "vm_ip" not in data or "vm_name" not in data:
-            raise ValueError(f"Incomplete VM response: {data}")
+        if not vm_name:
+            raise Exception("VM name not returned")
 
-        logger.info(
-            "VM started successfully | vm_name=%s vm_ip=%s",
-            data.get("vm_name"),
-            data.get("vm_ip"),
-        )
+        # STEP 2: Poll for status
+        start_time = time.time()
 
-        return data
+        while time.time() - start_time < VM_STATUS_TIMEOUT:
 
-    except requests.exceptions.ReadTimeout:
-        logger.error(
-            "VM provisioning timed out (VM may still be booting in background)"
-        )
-        return {
-            "error": "VM provisioning timeout",
-            "detail": "VM is still starting, please wait"
-        }
+            status_response = requests.get(
+                f"{FASTAPI_VM_URL}/vm/status/{vm_name}",
+                timeout=30
+            )
 
-    except requests.exceptions.ConnectionError as e:
-        logger.exception("VM service connection failed")
-        return {
-            "error": "VM service unreachable",
-            "detail": str(e)
-        }
+            status_response.raise_for_status()
+            status_data = status_response.json()
 
-    except requests.exceptions.HTTPError as e:
-        logger.exception("VM service returned HTTP error")
-        return {
-            "error": "VM service error",
-            "detail": str(e),
-            "status_code": getattr(e.response, "status_code", None),
-        }
+            status = status_data.get("status")
+
+            if status == "running":
+                return {
+                    "vm_name": vm_name,
+                    "vm_ip": status_data.get("vm_ip"),
+                    "username": status_data.get("username"),
+                    "password": status_data.get("password"),
+                }
+
+            if status == "failed":
+                raise Exception(status_data.get("error", "VM failed"))
+
+            time.sleep(VM_STATUS_POLL_INTERVAL)
+
+        raise Exception("VM start timeout")
 
     except Exception as e:
-        logger.exception("Unexpected VM start failure")
+        logger.exception("VM start failed")
         return {
-            "error": "Unexpected VM start failure",
-            "detail": str(e)
+            "error": str(e)
         }
 
-
-# ============================
-# VERIFY VM (SAFE VERSION)
-# ============================
-
+# ==========================================
+# VERIFY VM
+# ==========================================
 def verify_vm(vm_ip: str, verify_script: str):
 
     if not vm_ip:
@@ -118,7 +95,6 @@ def verify_vm(vm_ip: str, verify_script: str):
         )
 
         response.raise_for_status()
-
         data = response.json()
 
         return {
@@ -142,18 +118,14 @@ def verify_vm(vm_ip: str, verify_script: str):
         }
 
 
-# ============================
-# DESTROY VM REMOTE (SAFE)
-# ============================
-
+# ==========================================
+# DESTROY VM
+# ==========================================
 def destroy_vm_remote(session: PracticalSession):
 
     if not session.vm_name:
-        logger.error("Destroy skipped — vm_name is empty for session %s", session.id)
+        logger.error("Destroy skipped — vm_name empty for session %s", session.id)
         return None
-
-    logger.info("Destroying VM | session=%s vm_name=%s",
-                session.id, session.vm_name)
 
     try:
         response = requests.post(
@@ -165,19 +137,7 @@ def destroy_vm_remote(session: PracticalSession):
         response.raise_for_status()
         data = response.json()
 
-        logger.info("Destroy response: %s", data)
-
-        history_path = data.get("history_path")
-
-        if history_path:
-            session.history_path = history_path
-            session.save(update_fields=["history_path"])
-
-        return history_path
-
-    except requests.Timeout:
-        logger.error("VM destroy timeout for session %s", session.id)
-        return None
+        return data.get("history_path")
 
     except requests.RequestException as e:
         logger.error("VM destroy error: %s", str(e))

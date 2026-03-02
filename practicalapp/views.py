@@ -160,7 +160,6 @@ def student_practical_start(request, pk):
 
     user = request.user
 
-    # Return existing running session
     existing = PracticalSession.objects.filter(
         user=user,
         status__in=["starting", "running"]
@@ -168,10 +167,10 @@ def student_practical_start(request, pk):
 
     if existing:
         description = render_description(existing.task, existing)
-
         return Response({
             "session_id": existing.id,
             "vm_ip": existing.vm_ip,
+            "status": existing.status,
             "duration": existing.task.duration_minutes,
             "title": existing.task.title,
             "description": description
@@ -186,23 +185,18 @@ def student_practical_start(request, pk):
     except PracticalTask.DoesNotExist:
         raise Http404("Task not found")
 
-    with transaction.atomic():
-        session = PracticalSession.objects.create(
-            user=user,
-            task=task,
-            status="starting"
-        )
+    session = PracticalSession.objects.create(
+        user=user,
+        task=task,
+        status="starting"
+    )
 
     vm = start_vm(task, user.email)
 
-    if not vm or "vm_ip" not in vm:
+    if vm.get("error"):
         session.status = "failed"
-        session.end_time = timezone.now()
         session.save()
-        return Response(
-            {"error": "VM provisioning failed"},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+        return Response(vm, status=500)
 
     session.vm_name = vm["vm_name"]
     session.vm_ip = vm["vm_ip"]
@@ -214,11 +208,11 @@ def student_practical_start(request, pk):
     return Response({
         "session_id": session.id,
         "vm_ip": session.vm_ip,
+        "status": "running",
         "duration": task.duration_minutes,
         "title": task.title,
         "description": description
     })
-
 
 # ============================================================
 # GET SESSION

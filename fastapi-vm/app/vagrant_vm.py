@@ -235,23 +235,33 @@ sudo systemctl restart sshd
 # ============================================================
 
 def run_init_script(ip, init_script):
-    if not init_script.strip():
-        return
 
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(ip, username="vagrant", password="vagrant")
+
+    ssh.connect(
+        ip,
+        username="vagrant",
+        password="vagrant",
+        allow_agent=False,
+        look_for_keys=False,
+        timeout=30
+    )
 
     remote_path = "/tmp/init_exam.sh"
 
     full_script = f"""#!/bin/bash
-set -euxo pipefail
+set -e
+set -x
 
-echo "=== INIT START ==="
+echo "========== INIT START =========="
+
 {init_script}
-echo "=== INIT END ==="
+
+echo "========== INIT END =========="
 """
 
+    # Upload script
     sftp = ssh.open_sftp()
     with sftp.file(remote_path, "w") as f:
         f.write(full_script)
@@ -259,24 +269,34 @@ echo "=== INIT END ==="
 
     ssh.exec_command(f"chmod +x {remote_path}")
 
+    # Execute and WAIT properly
     stdin, stdout, stderr = ssh.exec_command(
-        f"echo vagrant | sudo -S bash {remote_path}"
+        f"echo vagrant | sudo -S bash {remote_path}",
+        get_pty=True
     )
 
-    exit_code = stdout.channel.recv_exit_status()
+    exit_status = stdout.channel.recv_exit_status()
 
-    if exit_code != 0:
-        log = stdout.read().decode(errors="ignore")
-        ssh.close()
-        raise Exception(f"Init script failed:\n{log}")
+    output = stdout.read().decode(errors="ignore")
+    error = stderr.read().decode(errors="ignore")
+
+    print("===== INIT SCRIPT OUTPUT =====")
+    print(output)
+    print(error)
+    print("===== END INIT OUTPUT =====")
 
     ssh.close()
+
+    if exit_status != 0:
+        raise Exception(
+            f"Init script failed with exit code {exit_status}\n{output}\n{error}"
+        )
 
 # ============================================================
 # START VM (NO CRASH, SAFE CONCURRENCY)
 # ============================================================
 
-def start_vm(init_script):
+def start_vm(init_script=None):
     with vm_boot_semaphore:
 
         vm_id = f"exam-{uuid.uuid4().hex[:6]}"
@@ -287,19 +307,26 @@ def start_vm(init_script):
         create_vagrantfile(vm_dir, vm_id, vm_ip)
 
         try:
+            # FIRST BOOT
             subprocess.run(["vagrant", "up"], cwd=vm_dir, check=True)
+
             wait_for_ssh(vm_ip)
+
+            # Prepare exam user
             prepare_exam_user(vm_ip)
 
+            # Stop VM before disk attach
             subprocess.run(["vagrant", "halt"], cwd=vm_dir, check=True)
 
             if EXTRA_DISKS:
                 attach_extra_disks(vm_id, vm_dir)
 
+            # SECOND BOOT
             subprocess.run(["vagrant", "up"], cwd=vm_dir, check=True)
+
             wait_for_ssh(vm_ip)
 
-            run_init_script(vm_ip, init_script)
+            time.sleep(5)
 
             return {
                 "vm_name": vm_id,
@@ -309,7 +336,6 @@ def start_vm(init_script):
             }
 
         except Exception as e:
-            # CLEANUP ON FAILURE
             try:
                 subprocess.run(["vagrant", "destroy", "-f"], cwd=vm_dir)
             except:
@@ -414,10 +440,33 @@ echo "FINAL_SCORE=$SCORE"
 def destroy_vm_local(vm_name: str):
     vm_dir = os.path.join(VAGRANT_VM_ROOT, vm_name)
 
-    if not os.path.exists(vm_dir):
+    if not os.path.isdir(vm_dir):
+        print(f"[DESTROY] VM folder not found: {vm_dir}")
         return False
 
-    subprocess.run(["vagrant", "destroy", "-f"], cwd=vm_dir)
-    shutil.rmtree(vm_dir, ignore_errors=True)
+    try:
+        print(f"[DESTROY] Running vagrant destroy in {vm_dir}")
 
-    return True
+        result = subprocess.run(
+            ["vagrant", "destroy", "-f"],
+            cwd=vm_dir,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        print("[DESTROY OUTPUT]")
+        print(result.stdout)
+        print(result.stderr)
+
+        shutil.rmtree(vm_dir, ignore_errors=True)
+
+        print(f"[DESTROY] Folder removed: {vm_dir}")
+
+        return True
+
+    except subprocess.CalledProcessError as e:
+        print("[DESTROY ERROR]")
+        print(e.stdout)
+        print(e.stderr)
+        return False
