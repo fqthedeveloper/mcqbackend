@@ -1,4 +1,4 @@
-# 🚀 Smart Exam Platform (MCQ + Practical VM Evaluation)
+# 🚀 Smart Exam Platform Backend (MCQ + Practical VM Evaluation)
 
 A **production-grade hybrid examination platform** that supports:
 
@@ -191,7 +191,9 @@ venv\Scripts\activate
 pip install -r requirement.txt
 
 python manage.py migrate
-python manage.py runserver
+daphne mcqbackend.asgi:application --port 8000
+
+
 ```
 
 ---
