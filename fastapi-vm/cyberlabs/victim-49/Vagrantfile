@@ -1,0 +1,131 @@
+
+Vagrant.configure("2") do |config|
+
+  # =====================================================
+  # BASIC
+  # =====================================================
+
+  config.vm.box = "generic/ubuntu2204"
+
+  config.vm.hostname = "victim-49"
+
+  # =====================================================
+  # DISABLE SHARED FOLDER
+  # =====================================================
+
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  # =====================================================
+  # NETWORK
+  # =====================================================
+
+  config.vm.network "private_network", ip: "192.168.56.195"
+
+  # =====================================================
+  # SSH
+  # =====================================================
+
+  config.vm.boot_timeout = 1800
+
+  config.ssh.username = "vagrant"
+
+  config.ssh.password = "vagrant"
+
+  config.ssh.insert_key = false
+
+  config.ssh.keep_alive = true
+
+  # =====================================================
+  # VIRTUALBOX
+  # =====================================================
+
+  config.vm.provider "virtualbox" do |vb|
+
+    # HEADLESS MODE
+
+    vb.gui = false
+
+    # VM NAME
+
+    vb.name = "victim-49"
+
+    # RESOURCES
+
+    vb.memory = "2048"
+
+    vb.cpus = 2
+
+    # ===================================================
+    # VRAM FIX
+    # ===================================================
+
+    vb.customize [
+      "modifyvm",
+      :id,
+      "--graphicscontroller",
+      "vboxsvga"
+    ]
+
+    vb.customize [
+      "modifyvm",
+      :id,
+      "--vram",
+      "16"
+    ]
+
+    vb.customize [
+      "modifyvm",
+      :id,
+      "--accelerate3d",
+      "off"
+    ]
+
+    # ===================================================
+    # PERFORMANCE
+    # ===================================================
+
+    vb.customize [
+      "modifyvm",
+      :id,
+      "--audio-enabled",
+      "off"
+    ]
+
+    vb.customize [
+      "modifyvm",
+      :id,
+      "--clipboard-mode",
+      "disabled"
+    ]
+
+    vb.customize [
+      "modifyvm",
+      :id,
+      "--draganddrop",
+      "disabled"
+    ]
+
+    vb.customize [
+      "modifyvm",
+      :id,
+      "--usb",
+      "off"
+    ]
+
+    vb.customize [
+      "modifyvm",
+      :id,
+      "--usbehci",
+      "off"
+    ]
+
+    vb.customize [
+      "modifyvm",
+      :id,
+      "--nictype1",
+      "virtio"
+    ]
+
+  end
+
+end

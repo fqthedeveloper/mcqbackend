@@ -49,6 +49,7 @@ INSTALLED_APPS = [
     'django_celery_beat',
     'django_celery_results',
     'ckeditor',
+    'cyberpracticalapp',
 ]
 
 MIDDLEWARE = [
@@ -205,18 +206,51 @@ EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = 'smtp.gmail.com'
 EMAIL_PORT = 587
 EMAIL_USE_TLS = True
-EMAIL_HOST_USER = 'email@gmail.com'
-EMAIL_HOST_PASSWORD = 'My Password'
-DEFAULT_FROM_EMAIL = 'emial@gmail.com'
+EMAIL_HOST_USER = 'myemail@gmail.com'
+EMAIL_HOST_PASSWORD = 'password'
+DEFAULT_FROM_EMAIL = 'myemail@gmail.com'
 
 # ================= CHANNELS =================
 ASGI_APPLICATION = 'mcqbackend.asgi.application'
 
+# CHANNEL_LAYERS = {
+#     "default": {
+#         "BACKEND": "channels.layers.InMemoryChannelLayer",
+#     }
+# }
+
 CHANNEL_LAYERS = {
+
     "default": {
-        "BACKEND": "channels.layers.InMemoryChannelLayer",
-    }
+
+        "BACKEND": "channels_redis.core.RedisChannelLayer",
+
+        "CONFIG": {
+
+            "hosts": [("127.0.0.1", 6379)],
+        },
+    },
 }
+
+CELERY_BROKER_URL = 'redis://127.0.0.1:6379/0'
+
+CELERY_RESULT_BACKEND = 'django-db'
+
+CELERY_ACCEPT_CONTENT = ['json']
+
+CELERY_TASK_SERIALIZER = 'json'
+
+CELERY_RESULT_SERIALIZER = 'json'
+
+FASTAPI_VM_URL = "http://127.0.0.1:9000"
+
+CYBER_FASTAPI_VM_URL = "http://127.0.0.1:9001"
+
+GUACAMOLE_URL = "http://127.0.0.1:8080/guacamole"
+
+PROXMOX_ENABLED = False
+
+VM_NODE_MODE = "vagrant"
 
 VM_USER = os.getenv("VM_USER", "kiosk")
 VM_PASSWORD = os.getenv("VM_PASSWORD", "redhat")

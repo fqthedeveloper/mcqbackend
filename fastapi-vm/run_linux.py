@@ -3,24 +3,40 @@ import sys
 
 
 def main():
+
     try:
+
         subprocess.run(
+
             [
+
                 sys.executable,
+
                 "-m",
+
                 "uvicorn",
+
                 "app.main:app",
-                # "--host",
+
+                "--host",
+
                 # "0.0.0.0",
-                "--port",
+
+                # "--port",
+
                 "9000",
+
                 "--reload",
             ],
+
             check=True
         )
+
     except KeyboardInterrupt:
-        print("\nServer stopped")
+
+        print("\nLinux Practical Server stopped")
 
 
 if __name__ == "__main__":
+
     main()

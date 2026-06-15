@@ -24,6 +24,7 @@ urlpatterns = [
 
     path("api/mcq/", include("mcqapp.urls")),
     path("api/practical/", include("practicalapp.urls")),
+    path("api/cyber/", include("cyberpracticalapp.urls")),
 
     path("api-auth/", include("rest_framework.urls")),
 ]

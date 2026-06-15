@@ -714,10 +714,16 @@ class MyProfileView(APIView):
     def get(self, request):
         user = request.user
 
-        # IMPORTANT: decide verification source
-        # If you use Django default email verification
-        # adjust this logic if needed
-        is_verified = getattr(user, "is_verified", False)
+        # GET ACTIVE ENROLLED SUBJECTS
+        enrollments = StudentSubjectEnrollment.objects.filter(
+            student=user,
+            is_active=True,
+            subject__is_active=True
+        ).select_related("subject")
+
+        subjects = [en.subject for en in enrollments]
+
+        subject_data = SubjectSerializer(subjects, many=True).data
 
         return Response({
             "id": user.id,
@@ -725,17 +731,43 @@ class MyProfileView(APIView):
             "email": user.email,
             "first_name": user.first_name,
             "last_name": user.last_name,
-            "is_verified": is_verified,
+            "is_verified": getattr(user, "is_verified", False),
+
+            # RETURN SUBJECTS
+            "subjects": subject_data
+
         }, status=status.HTTP_200_OK)
 
     def put(self, request):
         user = request.user
 
-        user.first_name = request.data.get("first_name", user.first_name)
-        user.last_name = request.data.get("last_name", user.last_name)
-        user.email = request.data.get("email", user.email)
+        user.first_name = request.data.get(
+            "first_name",
+            user.first_name
+        )
+
+        user.last_name = request.data.get(
+            "last_name",
+            user.last_name
+        )
+
+        user.email = request.data.get(
+            "email",
+            user.email
+        )
 
         user.save()
+
+        # GET SUBJECTS AGAIN
+        enrollments = StudentSubjectEnrollment.objects.filter(
+            student=user,
+            is_active=True,
+            subject__is_active=True
+        ).select_related("subject")
+
+        subjects = [en.subject for en in enrollments]
+
+        subject_data = SubjectSerializer(subjects, many=True).data
 
         return Response({
             "username": user.username,
@@ -743,6 +775,9 @@ class MyProfileView(APIView):
             "first_name": user.first_name,
             "last_name": user.last_name,
             "is_verified": getattr(user, "is_verified", False),
+
+            "subjects": subject_data
+
         }, status=status.HTTP_200_OK)
         
         
